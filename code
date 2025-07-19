@@ -1,0 +1,51 @@
+import pandas as pd
+from mlxtend.frequent_patterns import apriori, association_rules
+
+# ✅ Step 1: Read your data
+df = pd.read_csv('your_data.csv')
+
+# ✅ Step 2: Prepare basket data (pivot table with Order ID & SKU Code)
+basket = (df.groupby(['order_id', 'sku_code'])['sku_quantity']
+          .sum().unstack().reset_index().fillna(0).set_index('order_id'))
+
+# ✅ Step 3: Convert to binary presence (1 = bought, 0 = not bought)
+basket = basket.applymap(lambda x: 1 if x > 0 else 0)
+
+# ✅ Step 4: Market Basket Analysis using Apriori
+frequent_itemsets = apriori(basket, min_support=0.01, use_colnames=True)
+rules = association_rules(frequent_itemsets, metric="lift", min_threshold=1.0)
+
+# ✅ Filter useful rules (single item to single recommendation)
+rules = rules[(rules['antecedents'].apply(lambda x: len(x) == 1)) & 
+              (rules['consequents'].apply(lambda x: len(x) == 1))]
+
+# ✅ Step 5: Map next best product per customer based on last purchased product
+# Getting last purchased SKU per customer
+last_purchase = df.groupby('customer_id').apply(lambda x: x.sort_values('order_id', ascending=False).iloc[0])
+last_purchase = last_purchase[['customer_id', 'sku_code', 'segmentation']].reset_index(drop=True)
+
+# ✅ Get Next Best Product
+def get_next_best(sku):
+    antecedent = frozenset([sku])
+    match = rules[rules['antecedents'] == antecedent]
+    if not match.empty:
+        return list(match.iloc[0]['consequents'])[0]
+    return None
+
+last_purchase['next_best_product'] = last_purchase['sku_code'].apply(get_next_best)
+
+# ✅ Step 6: Define action plan based on segmentation
+def action_plan(segment):
+    actions = {
+        'champion': 'Next Product - No Discount',
+        'loyal': 'Next Product + Small Discount',
+        'at_risk': 'Next Product + Heavy Discount',
+        'lost': 'Email with Discount Offer'
+    }
+    return actions.get(segment.lower(), 'No Action')
+
+last_purchase['action'] = last_purchase['segmentation'].apply(action_plan)
+
+# ✅ Final Output
+final_output = last_purchase[['customer_id', 'segmentation', 'sku_code', 'next_best_product', 'action']]
+print(final_output)
