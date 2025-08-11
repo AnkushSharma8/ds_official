@@ -1,0 +1,30 @@
+def get_user_based_recommendations(target_user, top_n_similar=5, top_n_items=5):
+    if target_user not in user_similarity_df.index:
+        return []
+
+    # Find similar users
+    similar_users = user_similarity_df[target_user].sort_values(ascending=False).iloc[1:top_n_similar+1]
+
+    # Get items bought by similar users
+    similar_users_items = user_item_matrix.loc[similar_users.index]
+
+    # Average item scores weighted by similarity
+    weighted_scores = np.dot(similar_users_items.T, similar_users.values)
+
+    # Convert to Series for ranking
+    scores_series = pd.Series(weighted_scores, index=user_item_matrix.columns)
+
+    # Remove items the target user already bought
+    purchased_items = user_item_matrix.loc[target_user]
+    scores_series = scores_series[purchased_items == 0]
+
+    # Return top-N recommended items
+    return scores_series.sort_values(ascending=False).head(top_n_items)
+
+# --------------------------
+# 5. Example usage
+# --------------------------
+target_customer = 'CUST123'
+recommendations = get_user_based_recommendations(target_customer)
+print(f"Recommendations for {target_customer}:")
+print(recommendations)
