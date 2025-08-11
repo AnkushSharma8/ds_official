@@ -27,4 +27,42 @@ def get_user_based_recommendations(target_user, top_n_similar=5, top_n_items=5):
 target_customer = 'CUST123'
 recommendations = get_user_based_recommendations(target_customer)
 print(f"Recommendations for {target_customer}:")
+
+import pandas as pd
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.metrics.pairwise import cosine_similarity
+
+# Example: df contains SQCode, Category, Subcategory, MaterialGroupName, AirportCode
+item_features = df[['SqCode', 'Category', 'SubcategoryName', 'MaterialGroupName', 'AirportCode']].drop_duplicates()
+
+# One-hot encode categorical features
+encoder = OneHotEncoder()
+encoded_features = encoder.fit_transform(item_features[['Category', 'SubcategoryName', 'MaterialGroupName', 'AirportCode']])
+
+# Compute item-to-item similarity
+item_similarity = cosine_similarity(encoded_features)
+
+# Map SQCode to index
+sq_index = pd.Series(item_features.index, index=item_features['SqCode'])
+
+def recommend_similar_items(purchased_sqcode, n=5):
+    idx = sq_index[purchased_sqcode]
+    sim_scores = list(enumerate(item_similarity[idx]))
+    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+    top_items = [item_features.iloc[i[0]]['SqCode'] for i in sim_scores[1:n+1]]
+    return top_items
+
+# Example: recommend for a first-time customer's purchased SQ
+first_time_customer_sq = "SQ1234"
+print(recommend_similar_items(first_time_customer_sq))
 print(recommendations)
+
+def top_popular_items(df, airport_code=None, n=5):
+    if airport_code:
+        popular = df[df['AirportCode'] == airport_code]['SqCode'].value_counts().head(n).index.tolist()
+    else:
+        popular = df['SqCode'].value_counts().head(n).index.tolist()
+    return popular
+
+# For a new user with airport code
+print(top_popular_items(df, airport_code="DEL"))
