@@ -1,68 +1,121 @@
-def get_user_based_recommendations(target_user, top_n_similar=5, top_n_items=5):
-    if target_user not in user_similarity_df.index:
-        return []
-
-    # Find similar users
-    similar_users = user_similarity_df[target_user].sort_values(ascending=False).iloc[1:top_n_similar+1]
-
-    # Get items bought by similar users
-    similar_users_items = user_item_matrix.loc[similar_users.index]
-
-    # Average item scores weighted by similarity
-    weighted_scores = np.dot(similar_users_items.T, similar_users.values)
-
-    # Convert to Series for ranking
-    scores_series = pd.Series(weighted_scores, index=user_item_matrix.columns)
-
-    # Remove items the target user already bought
-    purchased_items = user_item_matrix.loc[target_user]
-    scores_series = scores_series[purchased_items == 0]
-
-    # Return top-N recommended items
-    return scores_series.sort_values(ascending=False).head(top_n_items)
-
-# --------------------------
-# 5. Example usage
-# --------------------------
-target_customer = 'CUST123'
-recommendations = get_user_based_recommendations(target_customer)
-print(f"Recommendations for {target_customer}:")
-
+# --- Imports
+import numpy as np
 import pandas as pd
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.metrics.pairwise import cosine_similarity
+from scipy.sparse import coo_matrix, csr_matrix
+from sklearn.preprocessing import LabelEncoder
+from implicit.als import AlternatingLeastSquares
 
-# Example: df contains SQCode, Category, Subcategory, MaterialGroupName, AirportCode
-item_features = df[['SqCode', 'Category', 'SubcategoryName', 'MaterialGroupName', 'AirportCode']].drop_duplicates()
+# ---------------------------------------------------
+# 1) Filter to repeat users (like in your screenshot)
+#    and build a clean interactions frame
+# ---------------------------------------------------
+# df is your original dataframe
+# required columns: ['customerId', 'skuCode', 'skuQuantity', 'visitFlag']
 
-# One-hot encode categorical features
-encoder = OneHotEncoder()
-encoded_features = encoder.fit_transform(item_features[['Category', 'SubcategoryName', 'MaterialGroupName', 'AirportCode']])
+df_repeat = (
+    df.loc[df['visitFlag'].eq('repeat'), ['customerId', 'skuCode', 'skuQuantity']]
+      .copy()
+)
 
-# Compute item-to-item similarity
-item_similarity = cosine_similarity(encoded_features)
+# Keep only positive interactions
+df_repeat = df_repeat[df_repeat['skuQuantity'].fillna(0) > 0].copy()
 
-# Map SQCode to index
-sq_index = pd.Series(item_features.index, index=item_features['SqCode'])
+# ---------------------------------------------------
+# 2) Encode IDs (avoid SettingWithCopyWarning with .loc and .copy)
+# ---------------------------------------------------
+user_encoder = LabelEncoder()
+item_encoder = LabelEncoder()
 
-def recommend_similar_items(purchased_sqcode, n=5):
-    idx = sq_index[purchased_sqcode]
-    sim_scores = list(enumerate(item_similarity[idx]))
-    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
-    top_items = [item_features.iloc[i[0]]['SqCode'] for i in sim_scores[1:n+1]]
-    return top_items
+df_repeat.loc[:, 'uid'] = user_encoder.fit_transform(df_repeat['customerId'])
+df_repeat.loc[:, 'iid'] = item_encoder.fit_transform(df_repeat['skuCode'])
 
-# Example: recommend for a first-time customer's purchased SQ
-first_time_customer_sq = "SQ1234"
-print(recommend_similar_items(first_time_customer_sq))
-print(recommendations)
+# ---------------------------------------------------
+# 3) Build sparse user-item matrix
+# ---------------------------------------------------
+user_ids = df_repeat['uid'].astype(np.int32).to_numpy()
+item_ids = df_repeat['iid'].astype(np.int32).to_numpy()
+interactions = df_repeat['skuQuantity'].astype(np.float32).to_numpy()
 
-def top_popular_items(df, airport_code=None, n=5):
-    if airport_code:
-        popular = df[df['AirportCode'] == airport_code]['SqCode'].value_counts().head(n).index.tolist()
-    else:
-        popular = df['SqCode'].value_counts().head(n).index.tolist()
-    return popular
+n_users = df_repeat['uid'].nunique()
+n_items = df_repeat['iid'].nunique()
 
-# For a new user with airport code
-print(top_popular_items(df, airport_code="DEL"))
+# coo -> csr (ALS.recommend works best with CSR row access)
+user_item = coo_matrix(
+    (interactions, (user_ids, item_ids)),
+    shape=(n_users, n_items),
+    dtype=np.float32
+).tocsr()
+
+print("user_item shape:", user_item.shape)  # should look like (86605, 2877) in your case
+
+# ---------------------------------------------------
+# 4) Train ALS (implicit feedback)
+# ---------------------------------------------------
+# Tip: You can try confidence scaling like alpha * log(1 + qty) if your qtys are big
+model = AlternatingLeastSquares(
+    factors=50,
+    regularization=0.01,
+    iterations=20,
+    use_gpu=False
+)
+
+# ALS expects item-user matrix
+model.fit(user_item.T)
+
+# ---------------------------------------------------
+# 5) Helper: map back to original IDs
+# ---------------------------------------------------
+def recommend_skus_for_customer(customer_id, N=10):
+    """
+    Recommend top-N skuCodes for a given customer_id.
+    Falls back to popularity if the user is unseen (cold-start).
+    """
+    # Cold-start check
+    if customer_id not in set(user_encoder.classes_):
+        # Popularity fallback (overall top sellers among repeats)
+        popular = (
+            df_repeat.groupby('skuCode', as_index=False)['skuQuantity']
+                     .sum()
+                     .sort_values('skuQuantity', ascending=False)
+                     .head(N)['skuCode']
+                     .tolist()
+        )
+        return {
+            "customer_id": customer_id,
+            "cold_start": True,
+            "recommended_skuCodes": popular
+        }
+
+    # Known user -> use ALS
+    uidx = user_encoder.transform([customer_id])[0]
+
+    # Important: pass the row of user interactions from the CSR matrix
+    # filter_already_liked_items=True ensures we don't recommend already purchased SKUs
+    recs = model.recommend(
+        userid=uidx,
+        user_items=user_item[uidx],
+        N=N,
+        filter_already_liked_items=True,
+        recalculate_user=True
+    )
+
+    # recs is a list of (item_index, score)
+    item_indices = [i for i, _ in recs]
+    scores = [float(s) for _, s in recs]
+
+    sku_codes = item_encoder.inverse_transform(np.array(item_indices))
+    return {
+        "customer_id": customer_id,
+        "cold_start": False,
+        "recommended_skuCodes": list(sku_codes),
+        "scores": scores
+    }
+
+# ---------------------------------------------------
+# 6) Example usage
+# ---------------------------------------------------
+# known customer
+# print(recommend_skus_for_customer('CUST_123', N=10))
+
+# unseen customer (first visit) -> popularity fallback
+# print(recommend_skus_for_customer('NEW_USER_001', N=10))
