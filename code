@@ -1,51 +1,181 @@
-import pandas as pd
-from mlxtend.frequent_patterns import apriori, association_rules
+Product Recommendation Personalization
+Problem Statement
 
-# ✅ Step 1: Read your data
-df = pd.read_csv('your_data.csv')
+Conventional product recommendation systems are often static, relying heavily on item-to-item relationships. Such systems lack dynamic personalization, as they fail to adjust to real-time user intent (e.g., a user browsing chocolates even though their past purchases were liquor). They also struggle in cold-start situations (new users or new products).
 
-# ✅ Step 2: Prepare basket data (pivot table with Order ID & SKU Code)
-basket = (df.groupby(['order_id', 'sku_code'])['sku_quantity']
-          .sum().unstack().reset_index().fillna(0).set_index('order_id'))
+This results in:
 
-# ✅ Step 3: Convert to binary presence (1 = bought, 0 = not bought)
-basket = basket.applymap(lambda x: 1 if x > 0 else 0)
+Missed upsell and cross-sell opportunities.
 
-# ✅ Step 4: Market Basket Analysis using Apriori
-frequent_itemsets = apriori(basket, min_support=0.01, use_colnames=True)
-rules = association_rules(frequent_itemsets, metric="lift", min_threshold=1.0)
+Low engagement with product listings.
 
-# ✅ Filter useful rules (single item to single recommendation)
-rules = rules[(rules['antecedents'].apply(lambda x: len(x) == 1)) & 
-              (rules['consequents'].apply(lambda x: len(x) == 1))]
+Ineffective personalization for new or intent-shifting users.
 
-# ✅ Step 5: Map next best product per customer based on last purchased product
-# Getting last purchased SKU per customer
-last_purchase = df.groupby('customer_id').apply(lambda x: x.sort_values('order_id', ascending=False).iloc[0])
-last_purchase = last_purchase[['customer_id', 'sku_code', 'segmentation']].reset_index(drop=True)
+Goal: Develop a session-aware, user-to-user collaborative filtering recommendation engine that:
 
-# ✅ Get Next Best Product
-def get_next_best(sku):
-    antecedent = frozenset([sku])
-    match = rules[rules['antecedents'] == antecedent]
-    if not match.empty:
-        return list(match.iloc[0]['consequents'])[0]
-    return None
+Learns from user history, brand/category affinities, and purchase intent.
 
-last_purchase['next_best_product'] = last_purchase['sku_code'].apply(get_next_best)
+Adapts dynamically to current session behavior.
 
-# ✅ Step 6: Define action plan based on segmentation
-def action_plan(segment):
-    actions = {
-        'champion': 'Next Product - No Discount',
-        'loyal': 'Next Product + Small Discount',
-        'at_risk': 'Next Product + Heavy Discount',
-        'lost': 'Email with Discount Offer'
-    }
-    return actions.get(segment.lower(), 'No Action')
+Produces a ranked list of SKU codes most relevant to the user.
 
-last_purchase['action'] = last_purchase['segmentation'].apply(action_plan)
+Approach
 
-# ✅ Final Output
-final_output = last_purchase[['customer_id', 'segmentation', 'sku_code', 'next_best_product', 'action']]
-print(final_output)
+We design a hybrid user-to-user recommendation system, enriched with collaborative filtering and real-time session context.
+
+Core components:
+
+User-to-user similarity: Precompute user similarities using purchase patterns, browsing behavior, and brand/category affinities.
+
+Real-time re-ranking: Adjust SKU recommendations during the session based on active browsing signals (category, brand, price range).
+
+Cold-start handling: Utilize popularity trends and contextual cohort data when no user history is available.
+
+Continuous learning: Continuously refresh similarity graphs and popularity scores to ensure adaptability.
+
+Data Overview
+
+The dataset combines Google Analytics data and transaction logs, including:
+
+User Identifiers: user_id, date
+
+User Actions: visited SKU, purchase flag (yes/no), search context
+
+Affinities: user brand affinity, user category affinity
+
+Product Metadata: sq_code, price, category, subcategory, brand
+
+Derived Features: recency, frequency, spend range (to be engineered)
+
+Methodology
+
+Step 1: Data Cleaning & Preprocessing
+
+Remove duplicates and handle missing values (imputation at user level).
+
+Normalize numerical fields such as price.
+
+Encode categorical variables (brand, category, subcategory).
+
+Derive temporal features (hour, weekday, weekend).
+
+Step 2: Feature Engineering
+
+User embeddings: purchase ratios by brand, category, and price segments.
+
+Session features: active category viewed, brand preference, device type.
+
+Product features: brand, category, subcategory, price.
+
+Affinity metrics: brand similarity, category overlap, price proximity.
+
+Step 3: User Similarity Computation
+
+Construct a user-to-user similarity graph using cosine similarity on affinity vectors (brand, category, spend profile).
+
+Retain top-K similar users per user (neighborhood).
+
+Step 4: Candidate Generation
+
+From similar users’ purchases (collaborative filtering).
+
+From session context (SKUs aligned with current browsing).
+
+From popularity (recent trending SKUs in the same category).
+
+Step 5: Ranking Model
+Train a learning-to-rank model (e.g., LightGBM Ranker) with:
+
+User–product affinity scores.
+
+Session-context alignment signals.
+
+Popularity scores.
+
+Output: Ranked SKUs based on predicted relevance.
+
+Recommendation Strategy (Case Handling)
+
+History aligns with current intent
+
+Example: Past liquor purchases, browsing liquor now.
+
+Action: Recommend similar users’ liquor SKUs, tailored by brand and price.
+
+History differs from current intent
+
+Example: Past liquor purchases, browsing chocolates now.
+
+Action: Prioritize session intent (chocolates) and refine by brand affinity and spend range.
+
+No history (new user)
+
+Example: First-time browsing chocolates.
+
+Action: Recommend chocolates via session signals, supported by popularity trends and cohort behavior.
+
+Dataset Schema
+Feature	Description
+UserID	Unique identifier of the user.
+Date	Transaction or visit timestamp.
+SqCode	Unique identifier of an SKU (product).
+Visited	SKU visit flag (1 = yes, 0 = no).
+PurchaseStatus	Purchase flag (Yes/No).
+UserBrandAffinity	User’s affinity score toward specific brands.
+UserCategoryAffinity	User’s affinity score toward specific categories.
+SqPrice	Price of the SKU.
+SqCategory	Product category (e.g., Liquor, Chocolate, Perfume).
+SqSubcategory	Product subcategory (e.g., Vodka, Dark Chocolate, Eau de Parfum).
+TopViewedSq	List of SKUs most frequently viewed by the user (used for personalization).
+Engine Architecture
+A. Precomputation Layer (Offline)
+
+User–SKU Matrix:
+
+Rows: users | Columns: SKUs.
+
+Values: PurchaseStatus (1 = purchased, 0.5 = visited but not purchased).
+
+User Similarity:
+
+Compute pairwise cosine similarity.
+
+Store top-K most similar users per user (neighborhood).
+
+B. Runtime Layer (Online)
+
+At recommendation time:
+
+Identify intent: detect active category, brand, and price signals.
+
+Retrieve neighbors: fetch top-K similar users from precomputed similarity graph.
+
+Generate candidates: collect SKUs from neighbors’ history, excluding those already interacted with.
+
+Filter candidates: retain SKUs matching session intent (category, brand, price range).
+
+Rank results: score each SKU by similarity, brand affinity, category alignment, and price proximity.
+
+Output: return top-N ranked SKUs.
+
+Example Flow
+
+User A history: Buys Liquor (Vodka).
+
+Current session: Browsing Chocolates priced ₹200–₹300.
+
+Process:
+
+Find similar users who buy liquor and chocolates.
+
+Filter chocolates priced ~₹200–₹300.
+
+Rank candidates:
+
+SQ1023 (Cadbury Silk ₹250) – strong price + session match.
+
+SQ1099 (Ferrero ₹280) – strong brand alignment.
+
+SQ1122 (Cadbury Dark ₹220) – moderate similarity, strong session fit.
+
+Output: [SQ1023, SQ1099, SQ1122]
