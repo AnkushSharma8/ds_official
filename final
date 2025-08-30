@@ -1,0 +1,128 @@
+import pandas as pd
+from scipy.sparse import csr_matrix
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from implicit.als import AlternatingLeastSquares
+import numpy as np
+
+def personalized_recommendations(DF_category, DF_final, user_id, sq_code, top_n=5):
+    """
+    Hybrid Recommendation System
+
+    Case 1: If user's current category matches past history → ALS (Implicit MF)
+    Case 2: If not matching → Content/Affinity-based scoring
+             (using brand_affinity & category_affinity directly)
+    Case 3: If no history (cold start) → Use DF_category only 
+            → price + description similarity
+    """
+
+    # ---------------- Step 1: Validate sq_code & get category ----------------
+    if sq_code not in DF_category['sq_code'].values:
+        return []
+    current_category = DF_category.loc[DF_category['sq_code'] == sq_code, 'category_name'].iloc[0]
+
+    # ---------------- Step 2: User history ----------------
+    if user_id in DF_final['user_id'].unique():
+        user_history = DF_final[DF_final['user_id'] == user_id]
+        past_categories = set(user_history['category_name'])
+    else:
+        user_history = pd.DataFrame()
+        past_categories = set()
+
+    # ---------------- Step 3: Candidate products ----------------
+    candidates = DF_category[DF_category['category_name'] == current_category].copy()
+    if candidates.empty:
+        return []
+
+    # ---------------- Helper: Candidate scoring (Case 2) ----------------
+    def score_candidates(candidates, user_history):
+        # Use existing brand_affinity & category_affinity directly
+        if 'brand_affinity' in user_history and 'category_affinity' in user_history:
+            avg_brand_aff = user_history['brand_affinity'].mean()
+            avg_cat_aff   = user_history['category_affinity'].mean()
+        else:
+            avg_brand_aff, avg_cat_aff = 0, 0
+
+        # Map affinities to candidates
+        candidates['brand_score'] = candidates['brand_name'].apply(
+            lambda b: avg_brand_aff if b in user_history['brand_name'].values else 0
+        )
+        candidates['cat_score'] = candidates['category_name'].apply(
+            lambda c: avg_cat_aff if c in user_history['category_name'].values else 0
+        )
+
+        # Price preference
+        price_pref = user_history['median_rsp'].median() if not user_history.empty else candidates['median_rsp'].median()
+        candidates['price_score'] = -abs(candidates['median_rsp'] - price_pref)
+
+        # Quantity preference
+        avg_qty = user_history['sq_quantity'].mean() if not user_history.empty else 1
+        if 'sq_quantity' in candidates:
+            candidates['qty_score'] = -abs(candidates['sq_quantity'] - avg_qty)
+        else:
+            candidates['qty_score'] = 0
+
+        # Description similarity
+        current_desc = DF_category.loc[DF_category['sq_code'] == sq_code, 'sq_description'].iloc[0]
+        tfidf = TfidfVectorizer(stop_words='english')
+        desc_matrix = tfidf.fit_transform([current_desc] + candidates['sq_description'].fillna("").tolist())
+        sim_scores = cosine_similarity(desc_matrix[0:1], desc_matrix[1:]).flatten()
+        candidates['desc_score'] = sim_scores
+
+        # Final weighted score
+        candidates['final_score'] = (candidates['brand_score'] * 0.25 +
+                                     candidates['cat_score']   * 0.25 +
+                                     candidates['price_score'] * 0.15 +
+                                     candidates['qty_score']   * 0.1 +
+                                     candidates['desc_score']  * 0.25)
+        return candidates
+
+    # ---------------- Case 1: History matches current intent → ALS CF ----------------
+    if current_category in past_categories and not DF_final.empty:
+        user_item_matrix = DF_final.pivot_table(index='user_id',
+                                                columns='sq_code',
+                                                values='purchased_status',
+                                                aggfunc='sum',
+                                                fill_value=0)
+        # ALS needs item-user matrix
+        item_user_matrix = csr_matrix(user_item_matrix.T.values)
+
+        # Fit ALS model
+        als = AlternatingLeastSquares(factors=20, regularization=0.1, iterations=20)
+        als.fit(item_user_matrix)
+
+        if user_id in user_item_matrix.index:
+            user_idx = user_item_matrix.index.get_loc(user_id)
+            recs = als.recommend(user_idx,
+                                 csr_matrix(user_item_matrix.values),
+                                 N=top_n,
+                                 filter_already_liked_items=True)
+            rec_sq_codes = [user_item_matrix.columns[i] for i, _ in recs]
+            if rec_sq_codes:
+                return rec_sq_codes
+
+    # ---------------- Case 2: History exists but different intent ----------------
+    if user_id in DF_final['user_id'].unique():
+        scored = score_candidates(candidates, user_history)
+        recs = scored.sort_values('final_score', ascending=False).head(top_n)['sq_code'].tolist()
+        return recs
+
+    # ---------------- Case 3: Cold Start (no history at all) ----------------
+    ref_product = DF_category[DF_category['sq_code'] == sq_code].iloc[0]
+    ref_price = ref_product['median_rsp']
+    ref_desc = ref_product['sq_description']
+
+    # Price similarity
+    candidates['price_score'] = -abs(candidates['median_rsp'] - ref_price)
+
+    # Description similarity
+    tfidf = TfidfVectorizer(stop_words='english')
+    desc_matrix = tfidf.fit_transform([ref_desc] + candidates['sq_description'].fillna("").tolist())
+    sim_scores = cosine_similarity(desc_matrix[0:1], desc_matrix[1:]).flatten()
+    candidates['desc_score'] = sim_scores
+
+    # Final score for cold-start
+    candidates['final_score'] = candidates['price_score'] * 0.5 + candidates['desc_score'] * 0.5
+
+    recs = candidates.sort_values('final_score', ascending=False).head(top_n)['sq_code'].tolist()
+    return recs
