@@ -1,0 +1,222 @@
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col, lit, lower, trim, abs as spark_abs
+from pyspark.ml.feature import Tokenizer, HashingTF, IDF
+from pyspark.ml.recommendation import ALS
+from pyspark.sql.types import DoubleType
+import numpy as np
+
+# ----------------------------
+# Spark Session
+# ----------------------------
+spark = SparkSession.builder.appName("HybridRecommender").getOrCreate()
+
+# ----------------------------
+# Utility: Cosine Similarity
+# ----------------------------
+def cosine_sim(vec1, vec2):
+    dot = float(np.dot(vec1, vec2))
+    norm = (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+    return dot / norm if norm != 0 else 0.0
+
+
+# ----------------------------
+# Step 1: Train ALS model
+# ----------------------------
+def trainARSCollaborativeFiltering(df_final, rank=10, maxIter=10, regParam=0.1):
+    """
+    Train ALS model on user-item interaction data.
+    df_final: DataFrame with (user_id, sku_code, interaction)
+    """
+    als = ALS(
+        userCol="user_id",
+        itemCol="sku_code",
+        ratingCol="interaction",
+        rank=rank,
+        maxIter=maxIter,
+        regParam=regParam,
+        coldStartStrategy="drop"
+    )
+    model = als.fit(df_final)
+    return model
+
+
+# ----------------------------
+# Step 2: Cold Start Recommendations
+# ----------------------------
+def cold_start_recommendations(df_category, sku_code, top_n=5):
+    ref_product = df_category.filter(col("sku_code") == sku_code).limit(1).collect()[0]
+    ref_price = ref_product["medianRsp"]
+    ref_desc = ref_product["skuDescription"] or ""
+    ref_brand = ref_product["brandName"].strip().lower()
+
+    candidates = df_category.filter(col("sku_code") != sku_code)
+    if candidates.count() == 0:
+        return []
+
+    # --- Price similarity
+    price_diff = spark_abs(col("medianRsp") - ref_price)
+    max_diff = candidates.agg(F.max(price_diff)).collect()[0][0] or 1
+    candidates = candidates.withColumn("price_score", 1 - (price_diff / max_diff))
+
+    # --- Description similarity
+    tokenizer = Tokenizer(inputCol="skuDescription", outputCol="words")
+    wordsData = tokenizer.transform(candidates)
+    hashingTF = HashingTF(inputCol="words", outputCol="rawFeatures", numFeatures=5000)
+    featurizedData = hashingTF.transform(wordsData)
+    idf = IDF(inputCol="rawFeatures", outputCol="features")
+    idfModel = idf.fit(featurizedData)
+    rescaledData = idfModel.transform(featurizedData)
+
+    ref_df = spark.createDataFrame([(ref_desc,)], ["skuDescription"])
+    ref_words = tokenizer.transform(ref_df)
+    ref_feats = hashingTF.transform(ref_words)
+    ref_feats = idfModel.transform(ref_feats).collect()[0]["features"]
+
+    cosine_udf = F.udf(lambda vec: float(vec.dot(ref_feats) / (vec.norm(2) * ref_feats.norm(2)))
+                       if vec.norm(2) * ref_feats.norm(2) != 0 else 0.0, DoubleType())
+    rescaledData = rescaledData.withColumn("desc_score", cosine_udf(col("features")))
+
+    # --- Brand preference
+    rescaledData = rescaledData.withColumn(
+        "brand_pref_score",
+        F.when(lower(trim(col("brandName"))) == ref_brand, lit(1.0)).otherwise(lit(0.0))
+    )
+
+    # --- Final score
+    rescaledData = rescaledData.withColumn(
+        "final_score",
+        col("brand_pref_score") * 0.5 +
+        col("desc_score") * 0.3 +
+        col("price_score") * 0.2
+    )
+
+    ranked = rescaledData.orderBy(col("final_score").desc()).limit(top_n)
+    return [row.sku_code for row in ranked.collect()]
+
+
+# ----------------------------
+# Step 3: Personalized Recommendations
+# ----------------------------
+def personalized_recommendations(df_category, df_final, als_model, user_id, sku_code, top_n=5, sim_user_k=20):
+    """
+    Hybrid Recommendation System
+    Case 1: New user → Cold Start
+    Case 2: Known user + category match → ALS + re-rank
+    Case 3: Known user + category mismatch → Similar users (via ALS embeddings) + re-rank
+    """
+    # Reference SKU
+    ref_product = df_category.filter(col("sku_code") == sku_code).limit(1).collect()[0]
+    ref_category = ref_product["categoryName"]
+    ref_brand = ref_product["brandName"].strip().lower()
+    ref_price = ref_product["medianRsp"]
+    ref_desc = ref_product["skuDescription"] or ""
+
+    # User history
+    user_history = df_final.filter(col("user_id") == user_id)
+    if user_history.count() == 0:
+        return cold_start_recommendations(df_category, sku_code, top_n)
+
+    user_categories = [r["categoryName"] for r in user_history.select("categoryName").distinct().collect()]
+
+    # ----------------------------
+    # Case 2: Category matches
+    # ----------------------------
+    if ref_category in user_categories:
+        user_df = spark.createDataFrame([(user_id,)], ["user_id"])
+        recs = als_model.recommendForUserSubset(user_df, top_n * 5).collect()
+
+        if not recs:
+            return cold_start_recommendations(df_category, sku_code, top_n)
+
+        als_recs = [row.sku_code for row in recs[0].recommendations]
+        candidates = df_category.filter(col("sku_code").isin(als_recs)).filter(col("categoryName") == ref_category)
+
+        if candidates.count() == 0:
+            return cold_start_recommendations(df_category, sku_code, top_n)
+
+        # --- Price similarity
+        price_diff = spark_abs(col("medianRsp") - ref_price)
+        max_diff = candidates.agg(F.max(price_diff)).collect()[0][0] or 1
+        candidates = candidates.withColumn("price_score", 1 - (price_diff / max_diff))
+
+        # --- Description similarity
+        tokenizer = Tokenizer(inputCol="skuDescription", outputCol="words")
+        wordsData = tokenizer.transform(candidates)
+        hashingTF = HashingTF(inputCol="words", outputCol="rawFeatures", numFeatures=5000)
+        featurizedData = hashingTF.transform(wordsData)
+        idf = IDF(inputCol="rawFeatures", outputCol="features")
+        idfModel = idf.fit(featurizedData)
+        rescaledData = idfModel.transform(featurizedData)
+
+        ref_df = spark.createDataFrame([(ref_desc,)], ["skuDescription"])
+        ref_words = tokenizer.transform(ref_df)
+        ref_feats = hashingTF.transform(ref_words)
+        ref_feats = idfModel.transform(ref_feats).collect()[0]["features"]
+
+        cosine_udf = F.udf(lambda vec: float(vec.dot(ref_feats) / (vec.norm(2) * ref_feats.norm(2)))
+                           if vec.norm(2) * ref_feats.norm(2) != 0 else 0.0, DoubleType())
+        rescaledData = rescaledData.withColumn("desc_score", cosine_udf(col("features")))
+
+        # --- Brand preference
+        rescaledData = rescaledData.withColumn(
+            "brand_pref_score",
+            F.when(lower(trim(col("brandName"))) == ref_brand, lit(1.0)).otherwise(lit(0.0))
+        )
+
+        # --- Brand affinity
+        user_brands = user_history.groupBy("brandName").count()
+        top_brands = [r["brandName"].strip().lower() for r in user_brands.orderBy(col("count").desc()).limit(3).collect()]
+        rescaledData = rescaledData.withColumn(
+            "brand_affinity_score",
+            F.when(lower(trim(col("brandName"))).isin(top_brands), lit(1.0)).otherwise(lit(0.0))
+        )
+
+        # --- Final score
+        rescaledData = rescaledData.withColumn(
+            "final_score",
+            col("brand_affinity_score") * 0.3 +
+            col("brand_pref_score") * 0.25 +
+            col("desc_score") * 0.25 +
+            col("price_score") * 0.2
+        )
+
+        ranked = rescaledData.orderBy(col("final_score").desc()).limit(top_n)
+        return [row.sku_code for row in ranked.collect()]
+
+    # ----------------------------
+    # Case 3: Category mismatch → Similar Users
+    # ----------------------------
+    else:
+        user_factors = als_model.userFactors
+        vecs = user_factors.rdd.map(lambda r: (r.id, np.array(r.features))).collectAsMap()
+
+        if user_id not in vecs:
+            return cold_start_recommendations(df_category, sku_code, top_n)
+
+        ref_vec = vecs[user_id]
+
+        sims = [(uid, cosine_sim(ref_vec, vec)) for uid, vec in vecs.items() if uid != user_id]
+        sims = sorted(sims, key=lambda x: x[1], reverse=True)[:sim_user_k]
+        sim_user_ids = [uid for uid, _ in sims]
+
+        candidate_items = (
+            df_final.filter(col("user_id").isin(sim_user_ids))
+            .filter(col("categoryName") == ref_category)
+            .select("sku_code")
+            .distinct()
+        )
+
+        candidates = candidate_items.join(df_category, on="sku_code", how="inner")
+        if candidates.count() == 0:
+            return cold_start_recommendations(df_category, sku_code, top_n)
+
+        return cold_start_recommendations(candidates, sku_code, top_n)
+
+
+# ----------------------------
+# Step 4: Usage Example
+# ----------------------------
+# als_model = trainARSCollaborativeFiltering(df_final)
+# recs = personalized_recommendations(df_category, df_final, als_model, user_id=123, sku_code="SKU123", top_n=5)
+# print(recs)
