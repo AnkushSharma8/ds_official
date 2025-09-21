@@ -1,222 +1,304 @@
-from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.functions import col, lit, lower, trim, abs as spark_abs
-from pyspark.ml.feature import Tokenizer, HashingTF, IDF
+# Full PySpark pipeline for:
+# 1) Normal users -> Hybrid (ALS CF + CBF)
+# 2) Cold-start users -> CBF + Popularity
+
+# Imports
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.window import Window
+from pyspark.ml.feature import StringIndexer, Tokenizer, StopWordsRemover, HashingTF, IDF
 from pyspark.ml.recommendation import ALS
 from pyspark.sql.types import DoubleType
 import numpy as np
 
-# ----------------------------
-# Spark Session
-# ----------------------------
-spark = SparkSession.builder.appName("HybridRecommender").getOrCreate()
+# -------------------------
+# Assumptions / Inputs
+# -------------------------
+# - df_final: final enriched dataframe with columns:
+#   user_id, skuCode, total, brandName, categoryName, subCategoryName, skuDescription, medianRsp, brand_rank, category_rank, subcategory_rank
+# - df_category: product metadata table (skuCode, categoryName, subCategoryName, brandName, skuDescription, medianRsp, sellable, isRspSkuExists)
+#
+# Both df_final and df_category should already be loaded in the Spark session.
 
-# ----------------------------
-# Utility: Cosine Similarity
-# ----------------------------
-def cosine_sim(vec1, vec2):
-    dot = float(np.dot(vec1, vec2))
-    norm = (np.linalg.norm(vec1) * np.linalg.norm(vec2))
-    return dot / norm if norm != 0 else 0.0
+spark = SparkSession.builder.appName("HybridRecPipeline").getOrCreate()
 
+# For demonstration: comment these lines if df_final / df_category already exist in your session
+# df_final = spark.table("cdp.product_reccomendation.df_final")   # or wherever you stored it
+# df_category = spark.table("cdp.product_reccomendation.df_category")
 
-# ----------------------------
-# Step 1: Train ALS model
-# ----------------------------
-def trainARSCollaborativeFiltering(df_final, rank=10, maxIter=10, regParam=0.1):
+# -------------------------
+# 0) Small sanity checks
+# -------------------------
+required_cols = {"user_id", "skuCode", "total"}
+missing = required_cols - set(df_final.columns)
+if missing:
+    raise ValueError(f"df_final missing required columns: {missing}")
+
+# -------------------------
+# 1) Precompute Popularity (fallback)
+# -------------------------
+popularity_df = (
+    df_final
+    .groupBy("skuCode")
+    .agg(F.sum("total").alias("popularity"))
+    .orderBy(F.col("popularity").desc())
+)
+# Normalize popularity for later blending
+pop_max = popularity_df.agg(F.max("popularity").alias("max_pop")).collect()[0]["max_pop"] or 1.0
+popularity_df = popularity_df.withColumn("pop_norm", F.col("popularity") / F.lit(float(pop_max)))
+
+# Broadcast popularity for runtime joins (small table likely)
+popularity_b = F.broadcast(popularity_df.select("skuCode", "pop_norm"))
+
+# -------------------------
+# 2) Train ALS (Collaborative Filtering) - offline
+# -------------------------
+# Prepare ALS training data: user_id, skuCode, total
+df_als_prep = df_final.select("user_id", "skuCode", "total").dropna(subset=["user_id", "skuCode"])
+
+# Index users and items to numeric ids required by ALS
+user_indexer = StringIndexer(inputCol="user_id", outputCol="userIdx", handleInvalid="skip")
+item_indexer = StringIndexer(inputCol="skuCode", outputCol="itemIdx", handleInvalid="skip")
+
+ui_model = user_indexer.fit(df_als_prep)   # persist this model in production
+ii_model = item_indexer.fit(df_als_prep)   # persist this model in production
+
+df_als_indexed = ui_model.transform(df_als_prep)
+df_als_indexed = ii_model.transform(df_als_indexed)
+
+# Convert indices to integer type for ALS (they are doubles)
+df_als_indexed = df_als_indexed.withColumn("userIdx", F.col("userIdx").cast("int")).withColumn("itemIdx", F.col("itemIdx").cast("int"))
+
+# Train ALS (tune hyperparams offline)
+als = ALS(
+    userCol="userIdx",
+    itemCol="itemIdx",
+    ratingCol="total",
+    implicitPrefs=True,
+    rank=40,
+    regParam=0.1,
+    alpha=1.0,
+    coldStartStrategy="drop",
+    nonnegative=True,
+    maxIter=10
+)
+als_model = als.fit(df_als_indexed)
+
+# Build reverse maps to go from itemIdx->skuCode and userIdx->user_id
+item_idx_map = df_als_indexed.select("itemIdx", "skuCode").dropDuplicates(["itemIdx"])
+user_idx_map = df_als_indexed.select("userIdx", "user_id").dropDuplicates(["userIdx"])
+
+# Pre-generate ALS top-N candidates per user (e.g., top 50)
+als_user_recs = als_model.recommendForAllUsers(50)  # returns (userIdx, recommendations: array(struct(itemIdx, rating)))
+# Explode and attach user_id and skuCode
+als_exp = (
+    als_user_recs
+    .select("userIdx", F.explode("recommendations").alias("rec"))
+    .select("userIdx", F.col("rec.itemIdx").alias("itemIdx"), F.col("rec.rating").alias("als_score"), "userIdx")
+    .join(user_idx_map, on="userIdx", how="left")
+    .join(item_idx_map, on="itemIdx", how="left")
+    .select("user_id", "skuCode", "als_score")
+)
+
+# Cache ALS candidate table for fast joins
+als_exp = als_exp.cache()
+
+# -------------------------
+# 3) Content-Based Scoring (CBF) using viewed SKU metadata
+# -------------------------
+# We will produce a function that, given a runtime viewed SKU, computes candidate CBF scores
+def compute_cbf_candidates_for_intent(viewed_sku, df_category= df_category, price_tolerance=0.2):
     """
-    Train ALS model on user-item interaction data.
-    df_final: DataFrame with (user_id, sku_code, interaction)
+    Returns df of candidate items with columns: skuCode, cbf_score, categoryName, subCategoryName, brandName, medianRsp
     """
-    als = ALS(
-        userCol="user_id",
-        itemCol="sku_code",
-        ratingCol="interaction",
-        rank=rank,
-        maxIter=maxIter,
-        regParam=regParam,
-        coldStartStrategy="drop"
+    # Get metadata of the viewed sku
+    intent_meta = df_category.filter(F.col("skuCode") == viewed_sku).limit(1).collect()
+    if not intent_meta:
+        # If sku metadata missing, fallback to global popular items
+        return (
+            df_category
+            .join(popularity_b, on="skuCode", how="left")
+            .select("skuCode", "categoryName", "subCategoryName", "brandName", "medianRsp", F.coalesce(F.col("pop_norm"), F.lit(0.0)).alias("cbf_score"))
+            .orderBy(F.col("cbf_score").desc())
+            .limit(200)
+        )
+    intent = intent_meta[0].asDict()
+    intent_category = intent.get("categoryName")
+    intent_subcat = intent.get("subCategoryName")
+    intent_brand = intent.get("brandName")
+    intent_price = float(intent.get("medianRsp") or 0.0)
+
+    # Candidate selection: same category OR same subcategory OR same brand (you may expand)
+    candidates = df_category.filter(
+        (F.col("categoryName") == intent_category) |
+        (F.col("subCategoryName") == intent_subcat) |
+        (F.col("brandName") == intent_brand)
+    ).select("skuCode", "categoryName", "subCategoryName", "brandName", "medianRsp").dropDuplicates(["skuCode"])
+
+    # Compute rule-based cbf score:
+    # category match = 0.5, subcategory match = 0.3, brand match = 0.2
+    candidates = candidates.withColumn(
+        "cbf_score",
+        (F.when(F.col("categoryName") == intent_category, F.lit(0.5)).otherwise(F.lit(0.0))) +
+        (F.when(F.col("subCategoryName") == intent_subcat, F.lit(0.3)).otherwise(F.lit(0.0))) +
+        (F.when(F.col("brandName") == intent_brand, F.lit(0.2)).otherwise(F.lit(0.0)))
     )
-    model = als.fit(df_final)
-    return model
 
+    # Price proximity boost (if price known)
+    if intent_price > 0:
+        candidates = candidates.withColumn(
+            "price_boost",
+            F.when(F.abs(F.col("medianRsp") - F.lit(intent_price)) <= F.lit(intent_price * price_tolerance), F.lit(0.2)).otherwise(F.lit(0.0))
+        ).withColumn("cbf_score", F.col("cbf_score") + F.col("price_boost")).drop("price_boost")
 
-# ----------------------------
-# Step 2: Cold Start Recommendations
-# ----------------------------
-def cold_start_recommendations(df_category, sku_code, top_n=5):
-    ref_product = df_category.filter(col("sku_code") == sku_code).limit(1).collect()[0]
-    ref_price = ref_product["medianRsp"]
-    ref_desc = ref_product["skuDescription"] or ""
-    ref_brand = ref_product["brandName"].strip().lower()
+    # Join popularity to use in cold scenarios and normalize
+    candidates = candidates.join(popularity_b, on="skuCode", how="left").fillna({"pop_norm": 0.0})
 
-    candidates = df_category.filter(col("sku_code") != sku_code)
-    if candidates.count() == 0:
-        return []
+    # Final cbf_score combine with popularity lightly
+    candidates = candidates.withColumn("cbf_score", F.col("cbf_score") + F.col("pop_norm") * 0.1)
 
-    # --- Price similarity
-    price_diff = spark_abs(col("medianRsp") - ref_price)
-    max_diff = candidates.agg(F.max(price_diff)).collect()[0][0] or 1
-    candidates = candidates.withColumn("price_score", 1 - (price_diff / max_diff))
+    # Return top candidate set (limit to 200 for performance)
+    return candidates.orderBy(F.col("cbf_score").desc()).limit(200)
 
-    # --- Description similarity
-    tokenizer = Tokenizer(inputCol="skuDescription", outputCol="words")
-    wordsData = tokenizer.transform(candidates)
-    hashingTF = HashingTF(inputCol="words", outputCol="rawFeatures", numFeatures=5000)
-    featurizedData = hashingTF.transform(wordsData)
-    idf = IDF(inputCol="rawFeatures", outputCol="features")
-    idfModel = idf.fit(featurizedData)
-    rescaledData = idfModel.transform(featurizedData)
+# -------------------------
+# 4) Utilities: user history detection & affinity retrieval
+# -------------------------
+def user_has_history_runtime(user_id, df_final=df_final, min_interactions=1):
+    # Return True if user has at least min_interactions distinct items in df_final
+    cnt = df_final.filter(F.col("user_id") == user_id).select("skuCode").distinct().limit(min_interactions).count()
+    return cnt >= min_interactions
 
-    ref_df = spark.createDataFrame([(ref_desc,)], ["skuDescription"])
-    ref_words = tokenizer.transform(ref_df)
-    ref_feats = hashingTF.transform(ref_words)
-    ref_feats = idfModel.transform(ref_feats).collect()[0]["features"]
+def get_user_affinity_map(user_id, df_final=df_final):
+    # returns a dict-like row with brand_rank, category_rank, subcategory_rank per item if needed
+    # For scoring we will join later on (user_id, skuCode).
+    return df_final.filter(F.col("user_id") == user_id).select("user_id", "skuCode", "brand_rank", "category_rank", "subcategory_rank")
 
-    cosine_udf = F.udf(lambda vec: float(vec.dot(ref_feats) / (vec.norm(2) * ref_feats.norm(2)))
-                       if vec.norm(2) * ref_feats.norm(2) != 0 else 0.0, DoubleType())
-    rescaledData = rescaledData.withColumn("desc_score", cosine_udf(col("features")))
-
-    # --- Brand preference
-    rescaledData = rescaledData.withColumn(
-        "brand_pref_score",
-        F.when(lower(trim(col("brandName"))) == ref_brand, lit(1.0)).otherwise(lit(0.0))
-    )
-
-    # --- Final score
-    rescaledData = rescaledData.withColumn(
-        "final_score",
-        col("brand_pref_score") * 0.5 +
-        col("desc_score") * 0.3 +
-        col("price_score") * 0.2
-    )
-
-    ranked = rescaledData.orderBy(col("final_score").desc()).limit(top_n)
-    return [row.sku_code for row in ranked.collect()]
-
-
-# ----------------------------
-# Step 3: Personalized Recommendations
-# ----------------------------
-def personalized_recommendations(df_category, df_final, als_model, user_id, sku_code, top_n=5, sim_user_k=20):
+# -------------------------
+# 5) Runtime recommendation function
+# -------------------------
+def recommend_for_runtime_user(user_id, viewed_sku, top_k=10):
     """
-    Hybrid Recommendation System
-    Case 1: New user → Cold Start
-    Case 2: Known user + category match → ALS + re-rank
-    Case 3: Known user + category mismatch → Similar users (via ALS embeddings) + re-rank
+    Returns top_k recommendations (skuCode, final_score, reason columns)
+    Cases:
+      - If user has history -> Hybrid (ALS candidates + CBF scored & fused)
+      - If cold-start user -> Only CBF candidates + Popularity
     """
-    # Reference SKU
-    ref_product = df_category.filter(col("sku_code") == sku_code).limit(1).collect()[0]
-    ref_category = ref_product["categoryName"]
-    ref_brand = ref_product["brandName"].strip().lower()
-    ref_price = ref_product["medianRsp"]
-    ref_desc = ref_product["skuDescription"] or ""
+    # 1) prepare CBF candidates based on viewed SKU
+    cbf_candidates = compute_cbf_candidates_for_intent(viewed_sku)  # skuCode, cbf_score, pop_norm, ...
+    cbf_candidates = cbf_candidates.select("skuCode", "cbf_score", "categoryName", "subCategoryName", "brandName", "medianRsp", "pop_norm")
 
-    # User history
-    user_history = df_final.filter(col("user_id") == user_id)
-    if user_history.count() == 0:
-        return cold_start_recommendations(df_category, sku_code, top_n)
+    # 2) check if user has history
+    has_history = user_has_history_runtime(user_id)
 
-    user_categories = [r["categoryName"] for r in user_history.select("categoryName").distinct().collect()]
+    if has_history:
+        # -----------------------
+        # Hybrid case (history exists)
+        # -----------------------
 
-    # ----------------------------
-    # Case 2: Category matches
-    # ----------------------------
-    if ref_category in user_categories:
-        user_df = spark.createDataFrame([(user_id,)], ["user_id"])
-        recs = als_model.recommendForUserSubset(user_df, top_n * 5).collect()
+        # 3A) get ALS candidates for user (precomputed)
+        als_user = als_exp.filter(F.col("user_id") == user_id).select("skuCode", "als_score")
+        # If ALS produced no candidates (rare), fallback to popularity-based candidates
+        if als_user.rdd.isEmpty():
+            # fallback to popularity top
+            base = popularity_df.select("skuCode", "pop_norm").orderBy(F.col("pop_norm").desc()).limit(200)
+            als_user = base.withColumnRenamed("pop_norm", "als_score")
 
-        if not recs:
-            return cold_start_recommendations(df_category, sku_code, top_n)
-
-        als_recs = [row.sku_code for row in recs[0].recommendations]
-        candidates = df_category.filter(col("sku_code").isin(als_recs)).filter(col("categoryName") == ref_category)
-
-        if candidates.count() == 0:
-            return cold_start_recommendations(df_category, sku_code, top_n)
-
-        # --- Price similarity
-        price_diff = spark_abs(col("medianRsp") - ref_price)
-        max_diff = candidates.agg(F.max(price_diff)).collect()[0][0] or 1
-        candidates = candidates.withColumn("price_score", 1 - (price_diff / max_diff))
-
-        # --- Description similarity
-        tokenizer = Tokenizer(inputCol="skuDescription", outputCol="words")
-        wordsData = tokenizer.transform(candidates)
-        hashingTF = HashingTF(inputCol="words", outputCol="rawFeatures", numFeatures=5000)
-        featurizedData = hashingTF.transform(wordsData)
-        idf = IDF(inputCol="rawFeatures", outputCol="features")
-        idfModel = idf.fit(featurizedData)
-        rescaledData = idfModel.transform(featurizedData)
-
-        ref_df = spark.createDataFrame([(ref_desc,)], ["skuDescription"])
-        ref_words = tokenizer.transform(ref_df)
-        ref_feats = hashingTF.transform(ref_words)
-        ref_feats = idfModel.transform(ref_feats).collect()[0]["features"]
-
-        cosine_udf = F.udf(lambda vec: float(vec.dot(ref_feats) / (vec.norm(2) * ref_feats.norm(2)))
-                           if vec.norm(2) * ref_feats.norm(2) != 0 else 0.0, DoubleType())
-        rescaledData = rescaledData.withColumn("desc_score", cosine_udf(col("features")))
-
-        # --- Brand preference
-        rescaledData = rescaledData.withColumn(
-            "brand_pref_score",
-            F.when(lower(trim(col("brandName"))) == ref_brand, lit(1.0)).otherwise(lit(0.0))
+        # 3B) form candidate universe: union of ALS candidates and CBF candidates
+        cand_union = (
+            als_user.join(cbf_candidates, on="skuCode", how="outer")
+            .fillna({"als_score": 0.0, "cbf_score": 0.0, "pop_norm": 0.0})
+            .select("skuCode", "als_score", "cbf_score", "categoryName", "subCategoryName", "brandName", "medianRsp", "pop_norm")
         )
 
-        # --- Brand affinity
-        user_brands = user_history.groupBy("brandName").count()
-        top_brands = [r["brandName"].strip().lower() for r in user_brands.orderBy(col("count").desc()).limit(3).collect()]
-        rescaledData = rescaledData.withColumn(
-            "brand_affinity_score",
-            F.when(lower(trim(col("brandName"))).isin(top_brands), lit(1.0)).otherwise(lit(0.0))
+        # 3C) compute user-specific alpha (switching): if user has many distinct SKUs, use higher alpha
+        user_stats = df_final.filter(F.col("user_id") == user_id).agg(
+            F.countDistinct("skuCode").alias("n_items"),
+            F.sum("total").alias("history_sum")
+        ).collect()[0]
+        n_items = int(user_stats["n_items"] or 0)
+        # rule: n_items >= 5 -> alpha=0.75 else 0.5
+        alpha = 0.75 if n_items >= 5 else 0.5
+
+        # 3D) normalize als_score and cbf_score per user (min-max or by max)
+        max_als = cand_union.agg(F.max("als_score").alias("m")).collect()[0]["m"] or 1.0
+        max_cbf = cand_union.agg(F.max("cbf_score").alias("m")).collect()[0]["m"] or 1.0
+
+        cand_union = cand_union.withColumn("als_norm", F.col("als_score") / F.lit(float(max_als))) \
+                               .withColumn("cbf_norm", F.col("cbf_score") / F.lit(float(max_cbf)))
+
+        # 3E) blend scores
+        cand_union = cand_union.withColumn("hybrid_score", F.lit(alpha) * F.col("als_norm") + (F.lit(1.0) - F.lit(alpha)) * F.col("cbf_norm"))
+
+        # 3F) affinity boost join (user-specific ranks)
+        affinity = get_user_affinity_map(user_id)
+        # Join affinity (left) to cand_union
+        cand_union = cand_union.join(affinity, on="skuCode", how="left").fillna({"brand_rank": 999, "category_rank": 999, "subcategory_rank": 999})
+
+        # affinity multiplier: the closer the rank to 1, the higher the boost
+        cand_union = cand_union.withColumn(
+            "affinity_boost",
+            (1.0 / (F.col("brand_rank") + 1.0)) * 0.08 +
+            (1.0 / (F.col("category_rank") + 1.0)) * 0.06 +
+            (1.0 / (F.col("subcategory_rank") + 1.0)) * 0.04
         )
 
-        # --- Final score
-        rescaledData = rescaledData.withColumn(
-            "final_score",
-            col("brand_affinity_score") * 0.3 +
-            col("brand_pref_score") * 0.25 +
-            col("desc_score") * 0.25 +
-            col("price_score") * 0.2
-        )
+        # 3G) final score and ordering
+        cand_union = cand_union.withColumn("final_score", F.col("hybrid_score") + F.col("affinity_boost"))
+        # apply minor de-dup or business filtering: exclude the viewed SKU itself
+        cand_union = cand_union.filter(F.col("skuCode") != viewed_sku)
 
-        ranked = rescaledData.orderBy(col("final_score").desc()).limit(top_n)
-        return [row.sku_code for row in ranked.collect()]
+        # diversify (simple): penalize many same-category picks
+        # pick top 200 by final_score then penalize category counts
+        top_candidates = cand_union.orderBy(F.col("final_score").desc()).limit(200).cache()
+        # count category occurrences
+        cat_counts = top_candidates.groupBy("categoryName").agg(F.count("*").alias("cat_count"))
+        top_candidates = top_candidates.join(cat_counts, on="categoryName", how="left").withColumn("diversified_score", F.col("final_score") - F.col("cat_count") * 0.01)
 
-    # ----------------------------
-    # Case 3: Category mismatch → Similar Users
-    # ----------------------------
+        # final sort and pick top_k
+        final_out = top_candidates.orderBy(F.col("diversified_score").desc()).select(
+            "skuCode", "diversified_score", "hybrid_score", "als_score", "cbf_score", "brandName", "categoryName", "subCategoryName"
+        ).limit(top_k)
+
+        return final_out
+
     else:
-        user_factors = als_model.userFactors
-        vecs = user_factors.rdd.map(lambda r: (r.id, np.array(r.features))).collectAsMap()
+        # -----------------------
+        # Cold-start user (no history)
+        # -----------------------
+        # We rely heavily on CBF candidates + popularity
+        # Already have cbf_candidates (with cbf_score and pop_norm)
 
-        if user_id not in vecs:
-            return cold_start_recommendations(df_category, sku_code, top_n)
+        cold_cands = cbf_candidates.withColumn("final_score", F.col("cbf_score") * 0.8 + F.col("pop_norm") * 0.2)
 
-        ref_vec = vecs[user_id]
+        # Remove the viewed sku itself
+        cold_cands = cold_cands.filter(F.col("skuCode") != viewed_sku)
 
-        sims = [(uid, cosine_sim(ref_vec, vec)) for uid, vec in vecs.items() if uid != user_id]
-        sims = sorted(sims, key=lambda x: x[1], reverse=True)[:sim_user_k]
-        sim_user_ids = [uid for uid, _ in sims]
+        # Apply simple diversity and pick top_k
+        top_cold = cold_cands.orderBy(F.col("final_score").desc()).limit(200).cache()
+        cat_counts = top_cold.groupBy("categoryName").agg(F.count("*").alias("cat_count"))
+        top_cold = top_cold.join(cat_counts, on="categoryName", how="left").withColumn("diversified_score", F.col("final_score") - F.col("cat_count") * 0.01)
 
-        candidate_items = (
-            df_final.filter(col("user_id").isin(sim_user_ids))
-            .filter(col("categoryName") == ref_category)
-            .select("sku_code")
-            .distinct()
-        )
+        final_out = top_cold.orderBy(F.col("diversified_score").desc()).select(
+            "skuCode", "diversified_score", "cbf_score", "pop_norm", "brandName", "categoryName", "subCategoryName"
+        ).limit(top_k)
 
-        candidates = candidate_items.join(df_category, on="sku_code", how="inner")
-        if candidates.count() == 0:
-            return cold_start_recommendations(df_category, sku_code, top_n)
+        return final_out
 
-        return cold_start_recommendations(candidates, sku_code, top_n)
+# -------------------------
+# 6) Example usage (runtime)
+# -------------------------
+# Replace with actual runtime inputs from your app
+runtime_user = "USER_ABC_123"
+runtime_viewed_sku = "CHOC123"
 
+results_df = recommend_for_runtime_user(runtime_user, runtime_viewed_sku, top_k=10)
 
-# ----------------------------
-# Step 4: Usage Example
-# ----------------------------
-# als_model = trainARSCollaborativeFiltering(df_final)
-# recs = personalized_recommendations(df_category, df_final, als_model, user_id=123, sku_code="SKU123", top_n=5)
-# print(recs)
+# Show or persist results
+results_df.show(truncate=False)
+
+# Optionally write back to Hive or a serving table
+# results_df.withColumn("user_id", F.lit(runtime_user)) \
+#           .write.mode("overwrite").insertInto("cdp.product_reccomendation.runtime_recommendations")
+
+# -------------------------
+# End of script
+# -------------------------
