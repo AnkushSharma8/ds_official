@@ -1,259 +1,133 @@
-# hybrid_recommender.py
-import pandas as pd
+from pyspark.sql import SparkSession, functions as F
+from pyspark.ml.recommendation import ALS
+from pyspark.ml.feature import StringIndexer, Tokenizer, StopWordsRemover, HashingTF, IDF, VectorAssembler
+from pyspark.sql.functions import col, udf, explode
+from pyspark.sql.types import DoubleType
+from pyspark.sql.window import Window
 import numpy as np
-from scipy.sparse import csr_matrix
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import LabelEncoder
-from sklearn.cluster import KMeans
-import warnings
-
-# Optional: try to import implicit ALS (faster for large sparse data)
-try:
-    import implicit
-    HAS_IMPLICIT = True
-except Exception:
-    HAS_IMPLICIT = False
-    warnings.warn("`implicit` not installed — falling back to cosine CF. For scale, install implicit.")
 
 # -------------------------
-# 1) Utility preprocessing
+# Spark Session
 # -------------------------
-def prepare_data(df):
-    """Ensure columns & extract Month."""
-    df = df.copy()
-    df['OrderCreatedOn'] = pd.to_datetime(df['OrderCreatedOn'])
-    df['Month'] = df['OrderCreatedOn'].dt.to_period('M').astype(str)
-    # unify VisitFlag values
-    df['VisitFlag'] = df['VisitFlag'].astype(str)
-    # make sure necessary cols exist
-    for c in ['CustomerID','SQCode','SQQuantity','Revenue','AirportCode','Category','MaterialGroupName','SubcategoryName','UnitPrice','FirstSeenDate','LastSeenDate','TotalNumberOfOrders']:
-        if c not in df.columns:
-            df[c] = np.nan
-    return df
+spark = SparkSession.builder.appName("HybridRecPipeline").getOrCreate()
 
 # -------------------------
-# 2) Popularity by context
+# STEP 1: Prepare ALS Input
 # -------------------------
-def build_popularity_tables(df):
-    """Return top-N lists per (AirportCode, Month, Category) and global top-N"""
-    agg = df.groupby(['AirportCode','Month','Category','SQCode'])['Revenue'].sum().reset_index()
-    # produce a lookup dict for top SKUs
-    pop_lookup = {}
-    for (airport,month,category), g in agg.groupby(['AirportCode','Month','Category']):
-        top_skus = g.sort_values('Revenue', ascending=False)['SQCode'].tolist()
-        pop_lookup[(airport,month,category)] = top_skus
-    # also airport-month fallback
-    agg2 = df.groupby(['AirportCode','Month','SQCode'])['Revenue'].sum().reset_index()
-    pop_airport_month = {}
-    for (airport,month), g in agg2.groupby(['AirportCode','Month']):
-        pop_airport_month[(airport,month)] = g.sort_values('Revenue', ascending=False)['SQCode'].tolist()
-    # global popular
-    global_pop = df.groupby('SQCode')['Revenue'].sum().sort_values(ascending=False).index.tolist()
-    return pop_lookup, pop_airport_month, global_pop
+df_als_prep = df_final.select("user_id", "skuCode", "total").dropna(subset=["user_id", "skuCode"])
+
+# Index users and items
+user_indexer = StringIndexer(inputCol="user_id", outputCol="userIdx", handleInvalid="skip")
+item_indexer = StringIndexer(inputCol="skuCode", outputCol="itemIdx", handleInvalid="skip")
+ui_model = user_indexer.fit(df_als_prep)
+ii_model = item_indexer.fit(df_als_prep)
+
+df_als_indexed = ui_model.transform(df_als_prep)
+df_als_indexed = ii_model.transform(df_als_indexed)
+df_als_indexed = df_als_indexed.withColumn("userIdx", col("userIdx").cast("int")) \
+                               .withColumn("itemIdx", col("itemIdx").cast("int"))
 
 # -------------------------
-# 3) Product content vectors
+# STEP 2: Train ALS Model
 # -------------------------
-def build_product_tfidf(df, text_cols=['MaterialGroupName','Category','SubcategoryName']):
-    """Create a TF-IDF vectorizer over concatenated metadata for items"""
-    prod_meta = df[['SQCode'] + text_cols].drop_duplicates(subset=['SQCode']).fillna('')
-    prod_meta['meta_text'] = prod_meta[text_cols].agg(' '.join, axis=1)
-    tfv = TfidfVectorizer(max_features=5000, ngram_range=(1,2))
-    X = tfv.fit_transform(prod_meta['meta_text'])
-    prod_index = prod_meta['SQCode'].tolist()
-    prod_to_idx = {p:i for i,p in enumerate(prod_index)}
-    return tfv, X, prod_index, prod_to_idx
-
-def content_based_similar(sqcode, prod_to_idx, tfidf_matrix, prod_index, top_n=10):
-    """Return top-n most similar SQCodes to the given sqcode (excluding itself)"""
-    if sqcode not in prod_to_idx:
-        return []
-    idx = prod_to_idx[sqcode]
-    vec = tfidf_matrix[idx]
-    sims = cosine_similarity(vec, tfidf_matrix).reshape(-1)
-    sims[idx] = -1  # exclude itself
-    top_idx = np.argsort(sims)[::-1][:top_n]
-    return [prod_index[i] for i in top_idx]
+als = ALS(
+    userCol="userIdx", itemCol="itemIdx", ratingCol="total",
+    implicitPrefs=True, rank=70, regParam=0.05, alpha=40,
+    coldStartStrategy="drop", nonnegative=True, maxIter=15
+)
+als_model = als.fit(df_als_indexed)
 
 # -------------------------
-# 4) Collaborative Filtering (ALS if available else cosine user-based)
+# STEP 3: Generate ALS Recommendations
 # -------------------------
-def build_user_item_matrix(df, weight_col='Revenue'):
-    """Pivot repeat-customer interactions into sparse matrix and encoding maps"""
-    df_agg = df.groupby(['CustomerID','SQCode'])[weight_col].sum().reset_index()
-    user_enc = LabelEncoder().fit(df_agg['CustomerID'])
-    item_enc = LabelEncoder().fit(df_agg['SQCode'])
-    uids = user_enc.transform(df_agg['CustomerID'])
-    iids = item_enc.transform(df_agg['SQCode'])
-    data = df_agg[weight_col].values
-    mat = csr_matrix((data, (uids, iids)), shape=(len(user_enc.classes_), len(item_enc.classes_)))
-    return mat, user_enc, item_enc
+item_idx_map = df_als_indexed.select("itemIdx", "skuCode").dropDuplicates(["itemIdx"])
+user_idx_map = df_als_indexed.select("userIdx", "user_id").dropDuplicates(["userIdx"])
 
-def train_als_model(user_item_matrix, factors=32, regularization=0.01, iterations=15):
-    """Train implicit ALS (if available). Returns model or None if not available."""
-    if not HAS_IMPLICIT:
-        return None
-    # implicit expects item-user matrix
-    model = implicit.als.AlternatingLeastSquares(factors=factors, regularization=regularization, iterations=iterations)
-    # convert to (item x user) csr
-    model.fit((user_item_matrix.T).astype('double'))
-    return model
+als_user_recs = als_model.recommendForAllUsers(50)
 
-def cf_recommend_als(model, user_id, user_enc, item_enc, user_item_matrix, N=10):
-    """ALS recommend for encoded user id (original id string)."""
-    try:
-        uidx = user_enc.transform([user_id])[0]
-    except Exception:
-        return []
-    # model.recommend takes user index in user-space (encoded)
-    recommended = model.recommend(uidx, user_item_matrix[uidx], N=N, filter_already_liked_items=True)
-    # recommended is list of (item_idx, score)
-    rec_items = [item_enc.inverse_transform([i])[0] for i, _ in recommended]
-    return rec_items
+als_exp = (
+    als_user_recs
+    .select("userIdx", explode("recommendations").alias("rec"))
+    .select("userIdx", col("rec.itemIdx").alias("itemIdx"), col("rec.rating").alias("als_score"))
+    .join(user_idx_map, on="userIdx", how="left")
+    .join(item_idx_map, on="itemIdx", how="left")
+    .select("user_id", "skuCode", "als_score")
+)
 
-# Cosine-based fallback
-def cf_recommend_cosine(user_item_matrix, user_enc, item_enc, user_id, top_sim_users=5, top_n_items=10):
-    """User-based CF using cosine similarity on user vectors"""
-    try:
-        uidx = user_enc.transform([user_id])[0]
-    except Exception:
-        return []
-    user_vecs = user_item_matrix.toarray()
-    if user_vecs.shape[0] <= 1:
-        return []
-    sims = cosine_similarity(user_vecs)
-    sim_scores = sims[uidx]
-    sim_scores[uidx] = -1
-    top_users = np.argsort(sim_scores)[::-1][:top_sim_users]
-    # aggregate items from similar users
-    candidates = {}
-    for su in top_users:
-        items = np.where(user_vecs[su] > 0)[0]
-        for it in items:
-            candidates[it] = candidates.get(it, 0) + sim_scores[su] * user_vecs[su, it]
-    # remove already purchased
-    purchased = set(np.where(user_vecs[uidx] > 0)[0])
-    for p in purchased:
-        if p in candidates: del candidates[p]
-    ranked = sorted(candidates.items(), key=lambda x: x[1], reverse=True)[:top_n_items]
-    rec_items = [item_enc.inverse_transform([i])[0] for i, _ in ranked]
-    return rec_items
+# Enrich ALS recs with category info
+als_enriched = (
+    als_exp.join(df_category, on="skuCode", how="left")
+    .select("user_id", "skuCode", "als_score", "brandName", "categoryName", "skuDescription", "medianRsp")
+)
 
 # -------------------------
-# 5) Hybrid recommend wrapper
+# STEP 4: Build Content Vectors (TF-IDF + Price)
 # -------------------------
-class HybridRecommender:
-    def __init__(self, df):
-        self.df = prepare_data(df)
-        self.pop_lookup, self.pop_airport_month, self.global_pop = build_popularity_tables(self.df)
-        self.tfv, self.prod_tfidf, self.prod_index, self.prod_to_idx = build_product_tfidf(self.df)
-        self.user_item_matrix, self.user_enc, self.item_enc = build_user_item_matrix(self.df[self.df['VisitFlag'].str.lower().str.contains('repeat', na=False)])
-        self.als_model = None
-        if HAS_IMPLICIT and self.user_item_matrix.shape[0] > 0:
-            try:
-                self.als_model = train_als_model(self.user_item_matrix)
-            except Exception as e:
-                warnings.warn(f"ALS training failed: {e}")
-                self.als_model = None
+df_category_cb = df_category.withColumn(
+    "text_features",
+    F.concat_ws(" ", "brandName", "categoryName", "skuDescription")
+)
 
-        # Precompute customer history map (list of sqcodes sorted by last date)
-        hist = self.df.sort_values('OrderCreatedOn').groupby('CustomerID')['SQCode'].apply(list).to_dict()
-        self.customer_history = hist
+# Tokenize
+tokenizer = Tokenizer(inputCol="text_features", outputCol="tokens")
+df_tokens = tokenizer.transform(df_category_cb)
 
-    def recommend(self, customer_id=None, airport=None, month=None, top_n=10):
-        # normalize month to Period string if datetime passed
-        if isinstance(month, (pd.Timestamp, pd.DatetimeIndex)):
-            month = pd.to_datetime(month).to_period('M').astype(str)
+# Remove stopwords
+remover = StopWordsRemover(inputCol="tokens", outputCol="filtered_tokens")
+df_removed = remover.transform(df_tokens)
 
-        history = self.customer_history.get(customer_id, []) if customer_id is not None else []
-        # 1) Repeat
-        if len(history) >= 2:
-            # try ALS
-            if self.als_model is not None:
-                recs = cf_recommend_als(self.als_model, customer_id, self.user_enc, self.item_enc, self.user_item_matrix, N=top_n)
-            else:
-                recs = cf_recommend_cosine(self.user_item_matrix, self.user_enc, self.item_enc, customer_id, top_n_items=top_n)
-            # fallback to popularity if insufficient
-            if len(recs) < top_n:
-                fallback = self.pop_airport_month.get((airport, month), self.global_pop)
-                for s in fallback:
-                    if s not in recs:
-                        recs.append(s)
-                        if len(recs) >= top_n:
-                            break
-            return recs[:top_n]
+# TF
+hashingTF = HashingTF(inputCol="filtered_tokens", outputCol="rawFeatures", numFeatures=5000)
+df_tf = hashingTF.transform(df_removed)
 
-        # 2) One-time customer (exactly 1)
-        if len(history) == 1:
-            purchased = history[-1]
-            cb_recs = content_based_similar(purchased, self.prod_to_idx, self.prod_tfidf, self.prod_index, top_n=top_n*2)
-            # blend with popularity in context (airport,month,category)
-            blended = []
-            pop_context = []
-            if airport and month:
-                pop_context = self.pop_lookup.get((airport, month, self.df[self.df['SQCode']==purchased]['Category'].iloc[0] if not self.df[self.df['SQCode']==purchased].empty else None), [])
-                pop_context = pop_context if isinstance(pop_context, list) else []
-            # simple blend: alternate cb and pop, preferring cb
-            i_cb = i_pop = 0
-            while len(blended) < top_n and (i_cb < len(cb_recs) or i_pop < len(pop_context)):
-                if i_cb < len(cb_recs):
-                    candidate = cb_recs[i_cb]
-                    if candidate not in blended and candidate != purchased:
-                        blended.append(candidate)
-                    i_cb += 1
-                if i_pop < len(pop_context) and len(blended) < top_n:
-                    candidate = pop_context[i_pop]
-                    if candidate not in blended:
-                        blended.append(candidate)
-                    i_pop += 1
-            # final fallback to global popular
-            for s in self.global_pop:
-                if s not in blended:
-                    blended.append(s)
-                if len(blended) >= top_n:
-                    break
-            return blended[:top_n]
+# IDF
+idf = IDF(inputCol="rawFeatures", outputCol="tfidfFeatures")
+idf_model = idf.fit(df_tf)
+df_tfidf = idf_model.transform(df_tf)
 
-        # 3) Brand-new (no purchases)
-        # Try airport+month+category popularity, else airport-month, else global
-        if airport and month:
-            # If category is unknown, use airport-month popular
-            recs = self.pop_airport_month.get((airport, month), [])
-        else:
-            recs = self.global_pop
-        # ensure top_n results
-        recs = recs[:top_n] if len(recs) >= top_n else recs + [s for s in self.global_pop if s not in recs][:top_n-len(recs)]
-        return recs[:top_n]
+# Final vector: price + text embedding
+assembler = VectorAssembler(inputCols=["medianRsp", "tfidfFeatures"], outputCol="finalFeatures")
+df_features = assembler.transform(df_tfidf).select("skuCode", "finalFeatures")
 
 # -------------------------
-# 6) Example usage
+# STEP 5: Cosine Similarity Function
 # -------------------------
-if __name__ == "__main__":
-    # Example: load your CSV (replace path)
-    # df = pd.read_csv("dutyfree_transactions.csv")
-    # For demonstration, let's make a tiny dummy df if not loaded
-    try:
-        df
-    except NameError:
-        df = pd.DataFrame({
-            'OrderID':[1,2,3,4,5,6],
-            'CustomerID':['C1','C1','C2','C3','C4','C5'],
-            'SQCode':['SKU_A','SKU_B','SKU_A','SKU_C','SKU_D','SKU_E'],
-            'SQQuantity':[1,2,1,1,3,1],
-            'OrderCreatedOn':pd.date_range('2024-01-01', periods=6, freq='D'),
-            'AirportCode':['DEL','DEL','BOM','DEL','BOM','DEL'],
-            'UnitPrice':[100,200,100,150,50,80],
-            'Revenue':[100,400,100,150,150,80],
-            'VisitFlag':['Repeat','Repeat','First','First','Repeat','New'],
-            'Category':['Liquor','Liquor','Liquor','Perfume','Snacks','Perfume']
-        })
-    # Build recommender
-    recsys = HybridRecommender(df)
-    # Examples:
-    print("--- Repeat customer (C1) recommendations ---")
-    print(recsys.recommend(customer_id='C1', airport='DEL', month='2024-01', top_n=5))
-    print("--- One-time customer (C2) recommendations ---")
-    print(recsys.recommend(customer_id='C2', airport='BOM', month='2024-01', top_n=5))
-    print("--- New customer (no purchases) recommendations ---")
-    print(recsys.recommend(customer_id='UNKNOWN', airport='DEL', month='2024-01', top_n=5))
+def cosine_similarity(v1, v2):
+    v1 = np.array(v1.toArray())
+    v2 = np.array(v2.toArray())
+    denom = (np.linalg.norm(v1) * np.linalg.norm(v2))
+    return float(np.dot(v1, v2) / denom) if denom != 0 else 0.0
+
+# -------------------------
+# STEP 6: Runtime Function for User + Current SKU
+# -------------------------
+def get_recommendations(user_id, current_sku, top_n=30):
+    # Current SKU vector
+    current_vec = df_features.filter(col("skuCode") == current_sku).select("finalFeatures").collect()
+    if not current_vec:
+        raise ValueError(f"SKU {current_sku} not found in df_category.")
+    current_vec = current_vec[0][0]
+
+    # Define UDF with current vector fixed
+    cosine_udf = udf(lambda v: cosine_similarity(current_vec, v), DoubleType())
+
+    # ALS recs for this user
+    als_recs_user = als_enriched.filter(col("user_id") == user_id).limit(top_n)
+
+    # Join ALS recs with feature vectors
+    als_with_features = als_recs_user.join(df_features, on="skuCode", how="left")
+
+    # Compute similarity
+    als_with_similarity = als_with_features.withColumn("cosine_similarity", cosine_udf(col("finalFeatures")))
+
+    # Final output
+    return als_with_similarity.select("skuCode", "als_score", "cosine_similarity").orderBy(col("cosine_similarity").desc())
+
+# -------------------------
+# STEP 7: Example Run
+# -------------------------
+user_id = "USER123"      # runtime user
+current_sku = "SKU12345" # runtime SKU intent
+
+result = get_recommendations(user_id, current_sku, top_n=30)
+result.show(30, truncate=False)
