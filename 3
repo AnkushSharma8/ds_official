@@ -1,35 +1,30 @@
-from pyspark.sql import SparkSession, functions as F
+# =====================================================
+# 1. ALS Training & Recommendations
+# =====================================================
+from pyspark.sql import functions as F
+from pyspark.ml.feature import StringIndexer
 from pyspark.ml.recommendation import ALS
-from pyspark.ml.feature import StringIndexer, Tokenizer, StopWordsRemover, HashingTF, IDF, VectorAssembler
-from pyspark.sql.functions import col, udf, explode
-from pyspark.sql.types import DoubleType
-from pyspark.sql.window import Window
-import numpy as np
 
-# -------------------------
-# Spark Session
-# -------------------------
-spark = SparkSession.builder.appName("HybridRecPipeline").getOrCreate()
-
-# -------------------------
-# STEP 1: Prepare ALS Input
-# -------------------------
+# Prepare ALS input
 df_als_prep = df_final.select("user_id", "skuCode", "total").dropna(subset=["user_id", "skuCode"])
 
-# Index users and items
+# Index user_id and skuCode
 user_indexer = StringIndexer(inputCol="user_id", outputCol="userIdx", handleInvalid="skip")
 item_indexer = StringIndexer(inputCol="skuCode", outputCol="itemIdx", handleInvalid="skip")
+
 ui_model = user_indexer.fit(df_als_prep)
 ii_model = item_indexer.fit(df_als_prep)
 
 df_als_indexed = ui_model.transform(df_als_prep)
 df_als_indexed = ii_model.transform(df_als_indexed)
-df_als_indexed = df_als_indexed.withColumn("userIdx", col("userIdx").cast("int")) \
-                               .withColumn("itemIdx", col("itemIdx").cast("int"))
 
-# -------------------------
-# STEP 2: Train ALS Model
-# -------------------------
+df_als_indexed = (
+    df_als_indexed
+    .withColumn("userIdx", F.col("userIdx").cast("int"))
+    .withColumn("itemIdx", F.col("itemIdx").cast("int"))
+)
+
+# Train ALS model
 als = ALS(
     userCol="userIdx", itemCol="itemIdx", ratingCol="total",
     implicitPrefs=True, rank=70, regParam=0.05, alpha=40,
@@ -37,97 +32,107 @@ als = ALS(
 )
 als_model = als.fit(df_als_indexed)
 
-# -------------------------
-# STEP 3: Generate ALS Recommendations
-# -------------------------
+# Mapping for decoding
 item_idx_map = df_als_indexed.select("itemIdx", "skuCode").dropDuplicates(["itemIdx"])
 user_idx_map = df_als_indexed.select("userIdx", "user_id").dropDuplicates(["userIdx"])
 
+# Get Top-N recommendations
 als_user_recs = als_model.recommendForAllUsers(50)
 
+# Explode into flat table
 als_exp = (
     als_user_recs
-    .select("userIdx", explode("recommendations").alias("rec"))
-    .select("userIdx", col("rec.itemIdx").alias("itemIdx"), col("rec.rating").alias("als_score"))
+    .select("userIdx", F.explode("recommendations").alias("rec"))
+    .select("userIdx", F.col("rec.itemIdx").alias("itemIdx"), F.col("rec.rating").alias("als_score"))
     .join(user_idx_map, on="userIdx", how="left")
     .join(item_idx_map, on="itemIdx", how="left")
     .select("user_id", "skuCode", "als_score")
 )
 
-# Enrich ALS recs with category info
+# Enrich with metadata
 als_enriched = (
-    als_exp.join(df_category, on="skuCode", how="left")
+    als_exp
+    .join(df_category, on="skuCode", how="left")
     .select("user_id", "skuCode", "als_score", "brandName", "categoryName", "skuDescription", "medianRsp")
 )
 
-# -------------------------
-# STEP 4: Build Content Vectors (TF-IDF + Price)
-# -------------------------
-df_category_cb = df_category.withColumn(
-    "text_features",
-    F.concat_ws(" ", "brandName", "categoryName", "skuDescription")
-)
+# =====================================================
+# 2. Cosine Similarity Filtering (ALS Top-N vs Current SKU)
+# =====================================================
+from pyspark.ml.feature import Tokenizer, StopWordsRemover, HashingTF, IDF, VectorAssembler
+from pyspark.sql.types import DoubleType
+import numpy as np
 
-# Tokenize
-tokenizer = Tokenizer(inputCol="text_features", outputCol="tokens")
-df_tokens = tokenizer.transform(df_category_cb)
-
-# Remove stopwords
-remover = StopWordsRemover(inputCol="tokens", outputCol="filtered_tokens")
-df_removed = remover.transform(df_tokens)
-
-# TF
-hashingTF = HashingTF(inputCol="filtered_tokens", outputCol="rawFeatures", numFeatures=5000)
-df_tf = hashingTF.transform(df_removed)
-
-# IDF
-idf = IDF(inputCol="rawFeatures", outputCol="tfidfFeatures")
-idf_model = idf.fit(df_tf)
-df_tfidf = idf_model.transform(df_tf)
-
-# Final vector: price + text embedding
-assembler = VectorAssembler(inputCols=["medianRsp", "tfidfFeatures"], outputCol="finalFeatures")
-df_features = assembler.transform(df_tfidf).select("skuCode", "finalFeatures")
-
-# -------------------------
-# STEP 5: Cosine Similarity Function
-# -------------------------
+# Cosine similarity function
 def cosine_similarity(v1, v2):
     v1 = np.array(v1.toArray())
     v2 = np.array(v2.toArray())
     denom = (np.linalg.norm(v1) * np.linalg.norm(v2))
     return float(np.dot(v1, v2) / denom) if denom != 0 else 0.0
 
-# -------------------------
-# STEP 6: Runtime Function for User + Current SKU
-# -------------------------
-def get_recommendations(user_id, current_sku, top_n=30):
-    # Current SKU vector
-    current_vec = df_features.filter(col("skuCode") == current_sku).select("finalFeatures").collect()
-    if not current_vec:
-        raise ValueError(f"SKU {current_sku} not found in df_category.")
-    current_vec = current_vec[0][0]
+# Runtime filtering function
+def get_filtered_recommendations(user_id, current_sku, top_n=50):
+    # 1. ALS recommendations for user
+    als_recs_user = als_enriched.filter(F.col("user_id") == user_id).limit(top_n)
+    if als_recs_user.count() == 0:
+        raise ValueError(f"No ALS recommendations found for user {user_id}")
 
-    # Define UDF with current vector fixed
-    cosine_udf = udf(lambda v: cosine_similarity(current_vec, v), DoubleType())
+    # 2. Metadata for current intent SKU
+    current_sku_meta = df_category.filter(F.col("skuCode") == current_sku)
+    if current_sku_meta.count() == 0:
+        raise ValueError(f"Current SKU {current_sku} not found in metadata.")
 
-    # ALS recs for this user
-    als_recs_user = als_enriched.filter(col("user_id") == user_id).limit(top_n)
+    # 3. Merge ALS recs + current SKU into one small DF
+    combined_df = als_recs_user.select("skuCode", "als_score", "brandName", "categoryName", "skuDescription", "medianRsp") \
+        .unionByName(
+            current_sku_meta.selectExpr(
+                "skuCode", "cast(null as double) as als_score",
+                "brandName", "categoryName", "skuDescription", "medianRsp"
+            )
+        )
 
-    # Join ALS recs with feature vectors
-    als_with_features = als_recs_user.join(df_features, on="skuCode", how="left")
+    # 4. Build features
+    combined_df = combined_df.withColumn(
+        "text_features", F.concat_ws(" ", "brandName", "categoryName", "skuDescription")
+    )
 
-    # Compute similarity
-    als_with_similarity = als_with_features.withColumn("cosine_similarity", cosine_udf(col("finalFeatures")))
+    tokenizer = Tokenizer(inputCol="text_features", outputCol="tokens")
+    remover = StopWordsRemover(inputCol="tokens", outputCol="filtered_tokens")
+    hashingTF = HashingTF(inputCol="filtered_tokens", outputCol="rawFeatures", numFeatures=5000)
+    idf = IDF(inputCol="rawFeatures", outputCol="tfidfFeatures")
+    assembler = VectorAssembler(inputCols=["medianRsp", "tfidfFeatures"], outputCol="finalFeatures")
 
-    # Final output
-    return als_with_similarity.select("skuCode", "als_score", "cosine_similarity").orderBy(col("cosine_similarity").desc())
+    df_tokens = tokenizer.transform(combined_df)
+    df_removed = remover.transform(df_tokens)
+    df_tf = hashingTF.transform(df_removed)
+    idf_model = idf.fit(df_tf)
+    df_tfidf = idf_model.transform(df_tf)
+    df_features = assembler.transform(df_tfidf).select("skuCode", "als_score", "finalFeatures")
 
-# -------------------------
-# STEP 7: Example Run
-# -------------------------
-user_id = "USER123"      # runtime user
-current_sku = "SKU12345" # runtime SKU intent
+    # 5. Extract current SKU vector
+    current_vec_row = df_features.filter(F.col("skuCode") == current_sku).select("finalFeatures").collect()
+    current_vec = current_vec_row[0][0]
 
-result = get_recommendations(user_id, current_sku, top_n=30)
-result.show(30, truncate=False)
+    # 6. Compute cosine similarity for ALS recs
+    def sim_udf(v):
+        return cosine_similarity(current_vec, v)
+
+    sim_udf_pyspark = F.udf(sim_udf, DoubleType())
+
+    result = (
+        df_features.filter(F.col("skuCode") != current_sku)
+        .withColumn("cosine_similarity", sim_udf_pyspark("finalFeatures"))
+        .select("skuCode", "als_score", "cosine_similarity")
+        .orderBy(F.col("cosine_similarity").desc())
+    )
+
+    return result
+
+# =====================================================
+# 3. Example Run
+# =====================================================
+user_id = "USER123"
+current_sku = "SKU12345"
+
+result = get_filtered_recommendations(user_id, current_sku, top_n=50)
+result.show(20, truncate=False)
