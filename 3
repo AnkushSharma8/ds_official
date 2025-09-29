@@ -4,6 +4,7 @@
 from pyspark.sql import functions as F
 from pyspark.ml.feature import StringIndexer
 from pyspark.ml.recommendation import ALS
+from pyspark.sql.window import Window
 
 # Prepare ALS input
 df_als_prep = df_final.select("user_id", "skuCode", "total").dropna(subset=["user_id", "skuCode"])
@@ -36,8 +37,8 @@ als_model = als.fit(df_als_indexed)
 item_idx_map = df_als_indexed.select("itemIdx", "skuCode").dropDuplicates(["itemIdx"])
 user_idx_map = df_als_indexed.select("userIdx", "user_id").dropDuplicates(["userIdx"])
 
-# Get Top-N recommendations
-als_user_recs = als_model.recommendForAllUsers(50)
+# Get Top-N recommendations for all users
+als_user_recs = als_model.recommendForAllUsers(200)  # keep enough to cover subcategories
 
 # Explode into flat table
 als_exp = (
@@ -53,104 +54,63 @@ als_exp = (
 als_enriched = (
     als_exp
     .join(df_category, on="skuCode", how="left")
-    .select("user_id", "skuCode", "als_score", "skuName", "skuDescription", "medianRsp")
+    .select("user_id", "skuCode", "als_score", "skuName", "subcategoryName", "brandName", "categoryName", "skuDescription", "medianRsp")
 )
 
 # =====================================================
-# 2. Cosine Similarity + Conditional Filtering
+# 2. Recommendation Functions
 # =====================================================
-from pyspark.ml.feature import Tokenizer, StopWordsRemover, HashingTF, IDF
-from pyspark.sql.types import DoubleType
-import numpy as np
 
-# Cosine similarity function
-def cosine_similarity(v1, v2):
-    v1 = np.array(v1.toArray())
-    v2 = np.array(v2.toArray())
-    denom = (np.linalg.norm(v1) * np.linalg.norm(v2))
-    return float(np.dot(v1, v2) / denom) if denom != 0 else 0.0
-
-# Main function
-def get_filtered_recommendations(user_id, current_sku, top_n=50, min_recs=5, cosine_thresh=0.7):
-    # 1. ALS recommendations for user
-    als_recs_user = als_enriched.filter(F.col("user_id") == user_id).limit(top_n)
-    if als_recs_user.count() == 0:
-        raise ValueError(f"No ALS recommendations found for user {user_id}")
-
-    # 2. Metadata for current intent SKU
-    current_sku_meta = df_category.filter(F.col("skuCode") == current_sku)
-    if current_sku_meta.count() == 0:
-        raise ValueError(f"Current SKU {current_sku} not found in metadata.")
-
-    # 3. Merge ALS recs + current SKU into one small DF
-    combined_df = als_recs_user.select(
-        "skuCode", "als_score", "skuName", "skuDescription", "medianRsp"
-    ).unionByName(
-        current_sku_meta.selectExpr(
-            "skuCode", "cast(null as double) as als_score", "skuName", "skuDescription", "medianRsp"
-        )
+# Raw ALS Top-N
+def get_raw_als_recs(user_id, top_n=20):
+    return (
+        als_enriched.filter(F.col("user_id") == user_id)
+        .orderBy(F.col("als_score").desc())
+        .limit(top_n)
     )
 
-    # 4. Build text features (EXCLUDE brandName & categoryName)
-    combined_df = combined_df.withColumn(
-        "text_features", 
-        F.concat_ws(" ", "skuName", "skuDescription", F.col("medianRsp").cast("string"))
+# Subcategory ALS Top-K per subcategory
+def get_subcat_als_recs(user_id, top_k=10):
+    als_recs_user = als_enriched.filter(F.col("user_id") == user_id)
+    
+    window_subcat = Window.partitionBy("subcategoryName").orderBy(F.col("als_score").desc())
+    
+    subcat_ranked = (
+        als_recs_user
+        .withColumn("rank", F.row_number().over(window_subcat))
+        .filter(F.col("rank") <= top_k)
+        .drop("rank")
     )
+    
+    return subcat_ranked
 
-    # TF-IDF pipeline
-    tokenizer = Tokenizer(inputCol="text_features", outputCol="tokens")
-    remover = StopWordsRemover(inputCol="tokens", outputCol="filtered_tokens")
-    hashingTF = HashingTF(inputCol="filtered_tokens", outputCol="rawFeatures", numFeatures=5000)
-    idf = IDF(inputCol="rawFeatures", outputCol="tfidfFeatures")
+# Combine raw + subcategory recs
+def get_combined_recs(user_id, raw_n=20, top_k=10):
+    raw_recs = get_raw_als_recs(user_id, top_n=raw_n)
+    subcat_recs = get_subcat_als_recs(user_id, top_k=top_k)
+    
+    return raw_recs.unionByName(subcat_recs).dropDuplicates(["skuCode"])
 
-    df_tokens = tokenizer.transform(combined_df)
-    df_removed = remover.transform(df_tokens)
-    df_tf = hashingTF.transform(df_removed)
-    idf_model = idf.fit(df_tf)
-    df_tfidf = idf_model.transform(df_tf).select(
-        "skuCode", "als_score", "skuName", "skuDescription", "medianRsp", "tfidfFeatures"
+# Final filtered by current SKU's subcategory
+def get_final_filtered(user_id, current_sku, raw_n=20, top_k=10):
+    combined = get_combined_recs(user_id, raw_n, top_k)
+    
+    # Find subcategory of current SKU
+    current_subcat_row = (
+        df_category.filter(F.col("skuCode") == current_sku)
+        .select("subcategoryName")
+        .collect()
     )
-
-    # 5. Extract current SKU vector
-    current_vec_row = df_tfidf.filter(F.col("skuCode") == current_sku).select("tfidfFeatures").collect()
-    current_vec = current_vec_row[0][0]
-
-    # 6. Compute cosine similarity for ALS recs
-    def sim_udf(v):
-        return cosine_similarity(current_vec, v)
-
-    sim_udf_pyspark = F.udf(sim_udf, DoubleType())
-
-    result = (
-        df_tfidf.filter(F.col("skuCode") != current_sku)
-        .withColumn("cosine_similarity", sim_udf_pyspark("tfidfFeatures"))
-    )
-
-    # 7. Apply cosine similarity threshold
-    filtered = result.filter(F.col("cosine_similarity") >= cosine_thresh)
-
-    # 8. Backfill if filtered < min_recs
-    count_filtered = filtered.count()
-    if count_filtered < min_recs:
-        missing = min_recs - count_filtered
-        # Compute similarity with entire catalog
-        df_cat = df_category.withColumn(
-            "text_features", F.concat_ws(" ", "skuName", "skuDescription", F.col("medianRsp").cast("string"))
-        )
-        df_tokens_cat = tokenizer.transform(df_cat)
-        df_removed_cat = remover.transform(df_tokens_cat)
-        df_tf_cat = hashingTF.transform(df_removed_cat)
-        df_tfidf_cat = idf_model.transform(df_tf_cat).select(
-            "skuCode", "skuName", "skuDescription", "medianRsp", "tfidfFeatures"
-        )
-        df_tfidf_cat = df_tfidf_cat.filter(~F.col("skuCode").isin([r["skuCode"] for r in filtered.collect()] + [current_sku]))
-        df_tfidf_cat = df_tfidf_cat.withColumn("cosine_similarity", sim_udf_pyspark("tfidfFeatures"))
-        backfill = df_tfidf_cat.orderBy(F.col("cosine_similarity").desc()).limit(missing)
-        filtered = filtered.unionByName(backfill)
-
-    # 9. Final output sorted by cosine similarity and ALS score
-    final_result = filtered.orderBy(F.col("cosine_similarity").desc(), F.col("als_score").desc())
-    return final_result.select("skuCode", "skuName", "skuDescription", "medianRsp", "als_score", "cosine_similarity")
+    
+    if not current_subcat_row:
+        raise ValueError(f"Current SKU {current_sku} not found in df_category.")
+    
+    current_subcat = current_subcat_row[0]["subcategoryName"]
+    
+    # Filter ALS recs by same subcategory
+    final_filtered = combined.filter(F.col("subcategoryName") == current_subcat)
+    
+    return final_filtered.orderBy(F.col("als_score").desc())
 
 # =====================================================
 # 3. Example Run
@@ -158,5 +118,5 @@ def get_filtered_recommendations(user_id, current_sku, top_n=50, min_recs=5, cos
 user_id = "USER123"
 current_sku = "SKU12345"
 
-result = get_filtered_recommendations(user_id, current_sku, top_n=50, min_recs=5, cosine_thresh=0.7)
-result.show(20, truncate=False)
+final_recs = get_final_filtered(user_id, current_sku, raw_n=20, top_k=10)
+final_recs.show(50, truncate=False)
