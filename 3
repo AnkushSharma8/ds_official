@@ -1,13 +1,13 @@
-# =====================================================
-# 1. ALS Training & Recommendations
-# =====================================================
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 from pyspark.ml.feature import StringIndexer
 from pyspark.ml.recommendation import ALS
-from pyspark.sql.window import Window
 
-# Prepare ALS input
-df_als_prep = df_final.select("user_id", "skuCode", "total").dropna(subset=["user_id", "skuCode"])
+# =====================================================
+# 1. ALS Training
+# =====================================================
+df_als_prep = df_final.select("user_id", "skuCode", "total") \
+    .dropna(subset=["user_id", "skuCode"])
 
 # Index user_id and skuCode
 user_indexer = StringIndexer(inputCol="user_id", outputCol="userIdx", handleInvalid="skip")
@@ -19,28 +19,36 @@ ii_model = item_indexer.fit(df_als_prep)
 df_als_indexed = ui_model.transform(df_als_prep)
 df_als_indexed = ii_model.transform(df_als_indexed)
 
-df_als_indexed = (
-    df_als_indexed
+df_als_indexed = (df_als_indexed
     .withColumn("userIdx", F.col("userIdx").cast("int"))
     .withColumn("itemIdx", F.col("itemIdx").cast("int"))
 )
 
 # Train ALS model
 als = ALS(
-    userCol="userIdx", itemCol="itemIdx", ratingCol="total",
-    implicitPrefs=True, rank=70, regParam=0.05, alpha=40,
-    coldStartStrategy="drop", nonnegative=True, maxIter=15
+    userCol="userIdx",
+    itemCol="itemIdx",
+    ratingCol="total",
+    implicitPrefs=True,
+    rank=70,
+    regParam=0.05,
+    alpha=40,
+    coldStartStrategy="drop",
+    nonnegative=True,
+    maxIter=15
 )
+
 als_model = als.fit(df_als_indexed)
 
 # Mapping for decoding
 item_idx_map = df_als_indexed.select("itemIdx", "skuCode").dropDuplicates(["itemIdx"])
 user_idx_map = df_als_indexed.select("userIdx", "user_id").dropDuplicates(["userIdx"])
 
-# Get Top-N recommendations for all users
-als_user_recs = als_model.recommendForAllUsers(200)  # keep enough to cover subcategories
+# =====================================================
+# 2. ALS Recommendations
+# =====================================================
+als_user_recs = als_model.recommendForAllUsers(200)  # Top 200 to be safe
 
-# Explode into flat table
 als_exp = (
     als_user_recs
     .select("userIdx", F.explode("recommendations").alias("rec"))
@@ -52,71 +60,44 @@ als_exp = (
 
 # Enrich with metadata
 als_enriched = (
-    als_exp
-    .join(df_category, on="skuCode", how="left")
-    .select("user_id", "skuCode", "als_score", "skuName", "subcategoryName", "brandName", "categoryName", "skuDescription", "medianRsp")
+    als_exp.join(df_category, on="skuCode", how="left")
+    .select("user_id", "skuCode", "als_score", "brandName", "categoryName", "subCategoryName", "sku_description", "median_rsp")
 )
 
-# =====================================================
-# 2. Recommendation Functions
-# =====================================================
-
-# Raw ALS Top-N
-def get_raw_als_recs(user_id, top_n=20):
-    return (
-        als_enriched.filter(F.col("user_id") == user_id)
-        .orderBy(F.col("als_score").desc())
-        .limit(top_n)
-    )
-
-# Subcategory ALS Top-K per subcategory
-def get_subcat_als_recs(user_id, top_k=10):
-    als_recs_user = als_enriched.filter(F.col("user_id") == user_id)
-    
-    window_subcat = Window.partitionBy("subcategoryName").orderBy(F.col("als_score").desc())
-    
-    subcat_ranked = (
-        als_recs_user
-        .withColumn("rank", F.row_number().over(window_subcat))
-        .filter(F.col("rank") <= top_k)
-        .drop("rank")
-    )
-    
-    return subcat_ranked
-
-# Combine raw + subcategory recs
-def get_combined_recs(user_id, raw_n=20, top_k=10):
-    raw_recs = get_raw_als_recs(user_id, top_n=raw_n)
-    subcat_recs = get_subcat_als_recs(user_id, top_k=top_k)
-    
-    return raw_recs.unionByName(subcat_recs).dropDuplicates(["skuCode"])
-
-# Final filtered by current SKU's subcategory
-def get_final_filtered(user_id, current_sku, raw_n=20, top_k=10):
-    combined = get_combined_recs(user_id, raw_n, top_k)
-    
-    # Find subcategory of current SKU
-    current_subcat_row = (
-        df_category.filter(F.col("skuCode") == current_sku)
-        .select("subcategoryName")
-        .collect()
-    )
-    
-    if not current_subcat_row:
-        raise ValueError(f"Current SKU {current_sku} not found in df_category.")
-    
-    current_subcat = current_subcat_row[0]["subcategoryName"]
-    
-    # Filter ALS recs by same subcategory
-    final_filtered = combined.filter(F.col("subcategoryName") == current_subcat)
-    
-    return final_filtered.orderBy(F.col("als_score").desc())
+# Add batch_date for retraining cycles
+als_enriched = als_enriched.withColumn("batch_date", F.current_date())
 
 # =====================================================
-# 3. Example Run
+# 3. Raw Top-N (per user)
 # =====================================================
-user_id = "USER123"
-current_sku = "SKU12345"
+window_raw = Window.partitionBy("user_id").orderBy(F.col("als_score").desc())
+raw_topn = (
+    als_enriched.withColumn("rank", F.row_number().over(window_raw))
+    .filter(F.col("rank") <= 50)  # top_n = 50
+    .drop("rank")
+)
 
-final_recs = get_final_filtered(user_id, current_sku, raw_n=20, top_k=10)
-final_recs.show(50, truncate=False)
+# Save table
+raw_topn.write.mode("overwrite").format("delta").saveAsTable("recommendations.raw_topn")
+
+# =====================================================
+# 4. Subcategory Top-K (per user, per subcategory)
+# =====================================================
+window_subcat = Window.partitionBy("user_id", "subCategoryName").orderBy(F.col("als_score").desc())
+subcat_topk = (
+    als_enriched.withColumn("rank", F.row_number().over(window_subcat))
+    .filter(F.col("rank") <= 10)  # top_k = 10
+    .drop("rank")
+)
+
+subcat_topk.write.mode("overwrite").format("delta").saveAsTable("recommendations.subcat_topk")
+
+# =====================================================
+# 5. Combined Recommendations
+# =====================================================
+combined_recs = (
+    raw_topn.unionByName(subcat_topk)
+    .dropDuplicates(["user_id", "skuCode"])
+)
+
+combined_recs.write.mode("overwrite").format("delta").saveAsTable("recommendations.combined")
