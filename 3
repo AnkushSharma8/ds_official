@@ -4,7 +4,7 @@ from pyspark.ml.feature import StringIndexer
 from pyspark.ml.recommendation import ALS
 
 # =====================================================
-# 1. ALS Training
+# 1. ALS Training Prep
 # =====================================================
 df_als_prep = df_final.select("user_id", "skuCode", "total") \
     .dropna(subset=["user_id", "skuCode"])
@@ -19,12 +19,12 @@ ii_model = item_indexer.fit(df_als_prep)
 df_als_indexed = ui_model.transform(df_als_prep)
 df_als_indexed = ii_model.transform(df_als_indexed)
 
-df_als_indexed = (df_als_indexed
-    .withColumn("userIdx", F.col("userIdx").cast("int"))
-    .withColumn("itemIdx", F.col("itemIdx").cast("int"))
-)
+df_als_indexed = df_als_indexed.withColumn("userIdx", F.col("userIdx").cast("int")) \
+                               .withColumn("itemIdx", F.col("itemIdx").cast("int"))
 
-# Train ALS model
+# =====================================================
+# 2. Train ALS model
+# =====================================================
 als = ALS(
     userCol="userIdx",
     itemCol="itemIdx",
@@ -45,9 +45,9 @@ item_idx_map = df_als_indexed.select("itemIdx", "skuCode").dropDuplicates(["item
 user_idx_map = df_als_indexed.select("userIdx", "user_id").dropDuplicates(["userIdx"])
 
 # =====================================================
-# 2. ALS Recommendations
+# 3. ALS Recommendations
 # =====================================================
-als_user_recs = als_model.recommendForAllUsers(200)  # Top 200 to be safe
+als_user_recs = als_model.recommendForAllUsers(200)  # Top 200
 
 als_exp = (
     als_user_recs
@@ -62,42 +62,111 @@ als_exp = (
 als_enriched = (
     als_exp.join(df_category, on="skuCode", how="left")
     .select("user_id", "skuCode", "als_score", "brandName", "categoryName", "subCategoryName", "sku_description", "median_rsp")
-)
-
-# Add batch_date for retraining cycles
-als_enriched = als_enriched.withColumn("batch_date", F.current_date())
+).withColumn("batch_date", F.current_date())
 
 # =====================================================
-# 3. Raw Top-N (per user)
+# 4. Raw Top-N (per user)
 # =====================================================
 window_raw = Window.partitionBy("user_id").orderBy(F.col("als_score").desc())
-raw_topn = (
-    als_enriched.withColumn("rank", F.row_number().over(window_raw))
-    .filter(F.col("rank") <= 50)  # top_n = 50
-    .drop("rank")
-)
-
-# Save table
-raw_topn.write.mode("overwrite").format("delta").saveAsTable("recommendations.raw_topn")
+raw_topn = als_enriched.withColumn("rank", F.row_number().over(window_raw)) \
+                       .filter(F.col("rank") <= 50) \
+                       .drop("rank")
 
 # =====================================================
-# 4. Subcategory Top-K (per user, per subcategory)
+# 5. Subcategory Top-K (per user, per subcategory)
 # =====================================================
 window_subcat = Window.partitionBy("user_id", "subCategoryName").orderBy(F.col("als_score").desc())
-subcat_topk = (
-    als_enriched.withColumn("rank", F.row_number().over(window_subcat))
-    .filter(F.col("rank") <= 10)  # top_k = 10
-    .drop("rank")
-)
-
-subcat_topk.write.mode("overwrite").format("delta").saveAsTable("recommendations.subcat_topk")
+subcat_topk = als_enriched.withColumn("rank", F.row_number().over(window_subcat)) \
+                          .filter(F.col("rank") <= 10) \
+                          .drop("rank")
 
 # =====================================================
-# 5. Combined Recommendations
+# 6. Combined Recommendations
 # =====================================================
-combined_recs = (
-    raw_topn.unionByName(subcat_topk)
-    .dropDuplicates(["user_id", "skuCode"])
+combined_recs = raw_topn.unionByName(subcat_topk).dropDuplicates(["user_id", "skuCode"])
+
+# Save combined recommendations as table
+combined_recs.write.mode("overwrite").format("delta").saveAsTable("cdp.product_recommendation.combined")
+
+# =====================================================
+# 7. Popularity Table
+# =====================================================
+sku_popularity = (
+    df_final.groupBy("skuCode")
+    .agg(F.sum("total").alias("popularity"))
+    .join(df_category, on="skuCode", how="left")
 )
 
-combined_recs.write.mode("overwrite").format("delta").saveAsTable("recommendations.combined")
+# Save popularity as table
+sku_popularity.write.mode("overwrite").format("delta").saveAsTable("cdp.product_recommendation.popularity")
+
+
+
+
+from pyspark.sql import functions as F
+
+def get_intent_top5(user_id: str, current_sku: str):
+    """
+    Returns Top-5 recommendations for a user given current SKU.
+    - ALS recommendations first (up to 3)
+    - Remaining backfilled from popularity
+    """
+    # Load pre-saved tables
+    combined_recs_tbl = spark.table("cdp.product_recommendation.combined")
+    sku_popularity_tbl = spark.table("cdp.product_recommendation.popularity")
+    df_category_tbl = df_category  # assuming already available in memory
+
+    # Get subcategory of current SKU
+    subcat_row = df_category_tbl.filter(F.col("skuCode") == current_sku).select("subCategoryName").first()
+    if not subcat_row:
+        raise ValueError(f"SKU {current_sku} not found in category mapping.")
+    current_subcat = subcat_row[0]
+
+    # ALS recommendations
+    intent_recs = (
+        combined_recs_tbl.filter((F.col("user_id") == user_id) & (F.col("subCategoryName") == current_subcat))
+        .orderBy(F.col("als_score").desc())
+        .limit(3)
+        .withColumn("source", F.lit("ALS"))
+    )
+
+    count_als = intent_recs.count()
+    backfill_needed = 3 - count_als
+    popularity_backfill = spark.createDataFrame([], intent_recs.schema)
+
+    if backfill_needed > 0:
+        exclude_skus = [r["skuCode"] for r in intent_recs.collect()] + [current_sku]
+        popularity_backfill = (
+            sku_popularity_tbl.filter(~F.col("skuCode").isin(exclude_skus))
+            .orderBy(F.col("popularity").desc())
+            .limit(backfill_needed)
+            .withColumn("user_id", F.lit(user_id))
+            .withColumn("als_score", F.lit(None).cast("double"))
+            .withColumn("source", F.lit("Popularity"))
+            .select(intent_recs.columns)
+        )
+
+    # Combine ALS + Popularity
+    final_recs = intent_recs.unionByName(popularity_backfill)
+
+    # Ensure total 5 recommendations
+    if final_recs.count() < 5:
+        exclude_skus = [r["skuCode"] for r in final_recs.collect()] + [current_sku]
+        extra_backfill = (
+            sku_popularity_tbl.filter(~F.col("skuCode").isin(exclude_skus))
+            .orderBy(F.col("popularity").desc())
+            .limit(5 - final_recs.count())
+            .withColumn("user_id", F.lit(user_id))
+            .withColumn("als_score", F.lit(None).cast("double"))
+            .withColumn("source", F.lit("Popularity"))
+            .select(intent_recs.columns)
+        )
+        final_recs = final_recs.unionByName(extra_backfill)
+
+    return final_recs.limit(5)
+
+# =====================================================
+# Example Usage
+# =====================================================
+# top5 = get_intent_top5("U12345", "SKU_987")
+# top5.show(truncate=False)
