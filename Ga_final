@@ -1,47 +1,136 @@
-from pyspark.sql import functions as F, Window
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.window import Window
+from pyspark.ml.feature import StringIndexer
+from pyspark.ml.recommendation import ALS
 
-# 1️⃣ Brand-wise ALS top 10 per user
+# =====================================================
+# 0️⃣ Spark Session
+# =====================================================
+spark = SparkSession.builder.getOrCreate()
+
+# =====================================================
+# 1️⃣ ALS Training Prep
+# =====================================================
+df_als_prep = df_final.select("user_id", "skuCode", "total").dropna(subset=["user_id", "skuCode"])
+
+# Index user_id and skuCode
+user_indexer = StringIndexer(inputCol="user_id", outputCol="userIdx", handleInvalid="skip")
+item_indexer = StringIndexer(inputCol="skuCode", outputCol="itemIdx", handleInvalid="skip")
+
+ui_model = user_indexer.fit(df_als_prep)
+ii_model = item_indexer.fit(df_als_prep)
+
+df_als_indexed = ui_model.transform(df_als_prep)
+df_als_indexed = ii_model.transform(df_als_indexed)
+
+df_als_indexed = df_als_indexed.withColumn("userIdx", F.col("userIdx").cast("int")) \
+                               .withColumn("itemIdx", F.col("itemIdx").cast("int"))
+
+# =====================================================
+# 2️⃣ Train ALS model
+# =====================================================
+als = ALS(
+    userCol="userIdx",
+    itemCol="itemIdx",
+    ratingCol="total",
+    implicitPrefs=True,
+    rank=70,
+    regParam=0.05,
+    alpha=40,
+    coldStartStrategy="drop",
+    nonnegative=True,
+    maxIter=15
+)
+
+als_model = als.fit(df_als_indexed)
+
+# =====================================================
+# 3️⃣ Mapping for decoding
+# =====================================================
+item_idx_map = df_als_indexed.select("itemIdx", "skuCode").dropDuplicates(["itemIdx"])
+user_idx_map = df_als_indexed.select("userIdx", "user_id").dropDuplicates(["userIdx"])
+
+# =====================================================
+# 4️⃣ ALS Recommendations
+# =====================================================
+als_user_recs = als_model.recommendForAllUsers(200)  # Top 200 recommendations
+
+als_exp = (
+    als_user_recs
+    .select("userIdx", F.explode("recommendations").alias("rec"))
+    .select(
+        "userIdx",
+        F.col("rec.itemIdx").alias("itemIdx"),
+        F.col("rec.rating").alias("als_score")
+    )
+    .join(user_idx_map, on="userIdx", how="left")
+    .join(item_idx_map, on="itemIdx", how="left")
+    .select("user_id", "skuCode", "als_score")
+)
+
+# =====================================================
+# 5️⃣ Enrich with metadata
+# =====================================================
+als_enriched = (
+    als_exp.join(df_category, on="skuCode", how="left")
+    .select("user_id", "skuCode", "als_score", "subCategoryName", "brandName")
+    .withColumn("batch_date", F.current_date())
+)
+
+# =====================================================
+# 6️⃣ Brand-wise ALS top 10 per user
+# =====================================================
 als_brand_recos = (
-    als_predictions  # columns: user_id, sku_code, brand_name, subcategory_name, rating
+    als_enriched
     .withColumn(
         "rank",
-        F.row_number().over(Window.partitionBy("user_id", "brand_name").orderBy(F.desc("rating")))
+        F.row_number().over(
+            Window.partitionBy("user_id", "brandName").orderBy(F.desc("als_score"))
+        )
     )
     .filter(F.col("rank") <= 10)
 )
 
-als_brand_recos.write.mode("overwrite").saveAsTable("als_brand_recos_table")
+als_brand_recos.write.mode("overwrite").saveAsTable("cdp.product_reccomendation.als_brand_recos_table")
 
-# 2️⃣ Brand popularity
+# =====================================================
+# 7️⃣ Brand popularity
+# =====================================================
 brand_popularity = (
-    df_final.groupBy("brand_name", "sku_code", "subcategory_name")
-    .agg(F.count("*").alias("sales_count"))
+    df_final.groupBy("brandName", "skuCode", "subCategoryName")
+    .agg(F.sum("total").alias("sales_count"))
     .withColumn(
         "rank",
-        F.row_number().over(Window.partitionBy("brand_name").orderBy(F.desc("sales_count")))
+        F.row_number().over(Window.partitionBy("brandName").orderBy(F.desc("sales_count")))
     )
 )
-brand_popularity.write.mode("overwrite").saveAsTable("brand_popularity_table")
 
-# 3️⃣ Subcategory popularity
+brand_popularity.write.mode("overwrite").saveAsTable("cdp.product_reccomendation.brand_popularity_table")
+
+# =====================================================
+# 8️⃣ Subcategory popularity
+# =====================================================
 subcategory_popularity = (
-    df_final.groupBy("subcategory_name", "sku_code", "brand_name")
-    .agg(F.count("*").alias("sales_count"))
+    df_final.groupBy("subCategoryName", "skuCode", "brandName")
+    .agg(F.sum("total").alias("sales_count"))
     .withColumn(
         "rank",
-        F.row_number().over(Window.partitionBy("subcategory_name").orderBy(F.desc("sales_count")))
+        F.row_number().over(Window.partitionBy("subCategoryName").orderBy(F.desc("sales_count")))
     )
 )
-subcategory_popularity.write.mode("overwrite").saveAsTable("subcategory_popularity_table")
 
-# 4️⃣ Overall popularity
+subcategory_popularity.write.mode("overwrite").saveAsTable("cdp.product_reccomendation.subcategory_popularity_table")
+
+# =====================================================
+# 9️⃣ Overall popularity
+# =====================================================
 overall_popularity = (
-    df_final.groupBy("sku_code", "brand_name", "subcategory_name")
-    .agg(F.count("*").alias("sales_count"))
+    df_final.groupBy("skuCode", "brandName", "subCategoryName")
+    .agg(F.sum("total").alias("sales_count"))
     .orderBy(F.desc("sales_count"))
 )
-overall_popularity.write.mode("overwrite").saveAsTable("overall_popularity_table")
 
+overall_popularity.write.mode("overwrite").saveAsTable("cdp.product_reccomendation.overall_popularity_table")
 
 
 
