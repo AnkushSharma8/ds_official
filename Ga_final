@@ -50,28 +50,33 @@ overall_popularity.write.mode("overwrite").saveAsTable("overall_popularity_table
 
 
 
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, functions as F
 
 spark = SparkSession.builder.getOrCreate()
 
+# =====================================================
 # Load all prepared tables
-als_brand_recos_table = spark.table("als_brand_recos_table")
-brand_popularity_table = spark.table("brand_popularity_table")
-subcategory_popularity_table = spark.table("subcategory_popularity_table")
-overall_popularity_table = spark.table("overall_popularity_table")
+# =====================================================
+als_brand_recos_table = spark.table("cdp.product_reccomendation.als_brand_recos_table")
+brand_popularity_table = spark.table("cdp.product_reccomendation.brand_popularity_table")
+subcategory_popularity_table = spark.table("cdp.product_reccomendation.subcategory_popularity_table")
+overall_popularity_table = spark.table("cdp.product_reccomendation.overall_popularity_table")
 
+# =====================================================
+# Recommendation Function
+# =====================================================
 def get_user_recommendations(user_id, current_sku):
     # Step 1️⃣ — Check if SKU present in df_category
     sku_data = (
-        df_category.filter(F.col("sku_code") == current_sku)
-        .select("brand_name", "subcategory_name")
+        df_category.filter(F.col("skuCode") == current_sku)
+        .select("brandName", "subCategoryName")
         .first()
     )
     if not sku_data:
         return f"SKU {current_sku} not found in df_category."
-    
-    brand_name = sku_data["brand_name"]
-    subcategory_name = sku_data["subcategory_name"]
+
+    brandName = sku_data["brandName"]
+    subCategoryName = sku_data["subCategoryName"]
 
     # Step 2️⃣ — Check if user exists in ALS table
     user_exists = (
@@ -82,18 +87,23 @@ def get_user_recommendations(user_id, current_sku):
     def merge_recos(base_df, add_df, n_needed):
         return (
             base_df.union(add_df)
-            .dropDuplicates(["sku_code"])
+            .dropDuplicates(["skuCode"])
             .limit(5)
         )
 
+    # =====================================================
     # Step 3️⃣ — ALS Flow
+    # =====================================================
     if user_exists:
         # a) Brand-based ALS recommendations
         als_brand_recos = (
             als_brand_recos_table
-            .filter((F.col("user_id") == user_id) & (F.col("brand_name") == brand_name))
-            .orderBy(F.desc("rating"))
-            .select("sku_code", "brand_name", "subcategory_name")
+            .filter(
+                (F.col("user_id") == user_id) &
+                (F.col("brandName") == brandName)
+            )
+            .orderBy(F.desc("als_score"))
+            .select("skuCode", "brandName", "subCategoryName")
         )
 
         final_recos = als_brand_recos.limit(5)
@@ -104,9 +114,12 @@ def get_user_recommendations(user_id, current_sku):
         if remaining > 0:
             als_subcat_recos = (
                 als_brand_recos_table
-                .filter((F.col("user_id") == user_id) & (F.col("subcategory_name") == subcategory_name))
-                .orderBy(F.desc("rating"))
-                .select("sku_code", "brand_name", "subcategory_name")
+                .filter(
+                    (F.col("user_id") == user_id) &
+                    (F.col("subCategoryName") == subCategoryName)
+                )
+                .orderBy(F.desc("als_score"))
+                .select("skuCode", "brandName", "subCategoryName")
                 .limit(remaining * 2)
             )
             final_recos = merge_recos(final_recos, als_subcat_recos, remaining)
@@ -116,8 +129,8 @@ def get_user_recommendations(user_id, current_sku):
         if remaining > 0:
             brand_pop = (
                 brand_popularity_table
-                .filter(F.col("brand_name") == brand_name)
-                .select("sku_code", "brand_name", "subcategory_name")
+                .filter(F.col("brandName") == brandName)
+                .select("skuCode", "brandName", "subCategoryName")
                 .limit(remaining * 2)
             )
             final_recos = merge_recos(final_recos, brand_pop, remaining)
@@ -125,7 +138,11 @@ def get_user_recommendations(user_id, current_sku):
 
         # d) Backfill from overall popularity
         if remaining > 0:
-            final_recos = merge_recos(final_recos, overall_popularity_table.select("sku_code", "brand_name", "subcategory_name"), remaining)
+            final_recos = merge_recos(
+                final_recos,
+                overall_popularity_table.select("skuCode", "brandName", "subCategoryName"),
+                remaining
+            )
 
         # Add user_id and source
         final_recos = (
@@ -133,37 +150,41 @@ def get_user_recommendations(user_id, current_sku):
             .withColumn("user_id", F.lit(user_id))
             .withColumn("source", F.lit("ALS Hierarchy: Brand → Subcat → Pop"))
         )
-
         return final_recos.limit(5)
 
-    # Step 4️⃣ — Cold Start User
+    # =====================================================
+    # Step 4️⃣ — Cold Start User (no ALS history)
+    # =====================================================
     else:
         brand_recos = (
             brand_popularity_table
-            .filter(F.col("brand_name") == brand_name)
-            .select("sku_code", "brand_name", "subcategory_name")
+            .filter(F.col("brandName") == brandName)
+            .select("skuCode", "brandName", "subCategoryName")
         )
-
         final_recos = brand_recos.limit(5)
         remaining = 5 - final_recos.count()
 
         if remaining > 0:
             sub_pop = (
                 subcategory_popularity_table
-                .filter(F.col("subcategory_name") == subcategory_name)
-                .select("sku_code", "brand_name", "subcategory_name")
+                .filter(F.col("subCategoryName") == subCategoryName)
+                .select("skuCode", "brandName", "subCategoryName")
                 .limit(remaining * 2)
             )
             final_recos = merge_recos(final_recos, sub_pop, remaining)
             remaining = 5 - final_recos.count()
 
         if remaining > 0:
-            final_recos = merge_recos(final_recos, overall_popularity_table.select("sku_code", "brand_name", "subcategory_name"), remaining)
+            final_recos = merge_recos(
+                final_recos,
+                overall_popularity_table.select("skuCode", "brandName", "subCategoryName"),
+                remaining
+            )
 
         final_recos = (
             final_recos
             .withColumn("user_id", F.lit(user_id))
             .withColumn("source", F.lit("Cold Start: Brand → Subcat → Pop"))
         )
-
         return final_recos.limit(5)
+
