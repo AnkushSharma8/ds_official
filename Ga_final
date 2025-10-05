@@ -188,3 +188,15 @@ def get_user_recommendations(user_id, current_sku):
         )
         return final_recos.limit(5)
 
+
+
+
+# Example inputs
+user_id = "U12345"
+current_sku = "SKU98765"
+
+# Call the function
+recommendations_df = get_user_recommendations(user_id, current_sku)
+
+# Show results in Spark DataFrame form
+recommendations_df.show(truncate=False)
