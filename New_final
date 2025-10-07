@@ -1,29 +1,144 @@
-from pyspark.sql.window import Window
-from pyspark.sql import functions as F
+from pyspark.sql import SparkSession, functions as F
 
-# Define a window partitioned by user, ordered by total engagement
-w_brand = Window.partitionBy("user_id", "brandName").orderBy(F.col("total").desc())
+spark = SparkSession.builder.getOrCreate()
 
-# Add brand_rank column
-df_final = df_final.withColumn("brand_rank", F.rank().over(w_brand))
+# =====================================================
+# Load all prepared tables
+# =====================================================
+als_brand_recos_table = spark.table("cdp.product_reccomendation.als_brand_recos_table")
+brand_popularity_table = spark.table("cdp.product_reccomendation.brand_popularity_table")
+subcategory_popularity_table = spark.table("cdp.product_reccomendation.subcategory_popularity_table")
+overall_popularity_table = spark.table("cdp.product_reccomendation.overall_popularity_table")
+df_category = spark.table("cdp.product_reccomendation.category_filtered")
+
+# =====================================================
+# Helper: Fast pseudo-random ordering (no global shuffle)
+# =====================================================
+def pseudo_random(df, seed_col="skuCode", user_id=None, n=5):
+    """
+    Lightweight pseudo-random sort without shuffle.
+    Uses hash() modulo logic to simulate randomness per user.
+    """
+    hash_col = F.pmod(F.hash(F.lit(user_id) + F.col(seed_col)), 100000)
+    return df.withColumn("rand_key", hash_col).orderBy("rand_key").limit(n).drop("rand_key")
 
 
+# =====================================================
+# Recommendation Function
+# =====================================================
+def get_user_recommendations(user_id, current_sku):
+    # Step 1️⃣ — Check if SKU present in df_category
+    sku_data = (
+        df_category.filter(F.col("skuCode") == current_sku)
+        .select("brandName", "subCategoryName")
+        .first()
+    )
+    if not sku_data:
+        return f"SKU {current_sku} not found in df_category."
 
+    brandName = sku_data["brandName"]
+    subCategoryName = sku_data["subCategoryName"]
 
-from pyspark.sql.window import Window
-from pyspark.sql import functions as F
+    # Step 2️⃣ — Check if user exists in ALS table
+    user_exists = (
+        als_brand_recos_table.filter(F.col("user_id") == user_id).limit(1).count() > 0
+    )
 
-# Define window per user and category total engagement
-w_cat = Window.partitionBy("user_id").orderBy(F.col("total").desc())
+    # Helper: keep recos unique and limited to 5
+    def merge_recos(base_df, add_df, n_needed):
+        return (
+            base_df.union(add_df)
+            .dropDuplicates(["skuCode"])
+            .limit(5)
+        )
 
-# Add category_rank per user
-df_final = df_final.withColumn("category_rank", F.rank().over(w_cat))
+    # =====================================================
+    # Step 3️⃣ — ALS Flow
+    # =====================================================
+    if user_exists:
+        # a) Brand-based ALS recommendations
+        als_brand_recos = (
+            als_brand_recos_table
+            .filter(
+                (F.col("user_id") == user_id)
+                & (F.col("brandName") == brandName)
+            )
+            .orderBy(F.desc("als_score"))
+            .select("skuCode", "brandName", "subCategoryName")
+        )
 
+        final_recos = als_brand_recos.limit(5)
+        remaining = 5 - final_recos.count()
 
+        # b) Backfill from ALS subcategory (same user, same subcategory)
+        if remaining > 0:
+            als_subcat_recos = (
+                als_brand_recos_table
+                .filter(
+                    (F.col("user_id") == user_id)
+                    & (F.col("subCategoryName") == subCategoryName)
+                )
+                .orderBy(F.desc("als_score"))
+                .select("skuCode", "brandName", "subCategoryName")
+            )
+            als_subcat_recos = pseudo_random(als_subcat_recos, "skuCode", user_id, remaining * 2)
+            final_recos = merge_recos(final_recos, als_subcat_recos, remaining)
+            remaining = 5 - final_recos.count()
 
+        # c) Backfill from brand popularity
+        if remaining > 0:
+            brand_pop = (
+                brand_popularity_table
+                .filter(F.col("brandName") == brandName)
+                .select("skuCode", "brandName", "subCategoryName")
+            )
+            brand_pop = pseudo_random(brand_pop, "skuCode", user_id, remaining * 2)
+            final_recos = merge_recos(final_recos, brand_pop, remaining)
+            remaining = 5 - final_recos.count()
 
-# Define window per user and subcategory total engagement
-w_subcat = Window.partitionBy("user_id").orderBy(F.col("total").desc())
+        # d) Backfill from overall popularity
+        if remaining > 0:
+            overall_pop = pseudo_random(overall_popularity_table, "skuCode", user_id, remaining * 2)
+            final_recos = merge_recos(final_recos, overall_pop, remaining)
 
-# Add subcategory_rank per user
-df_final = df_final.withColumn("subcategory_rank", F.rank().over(w_subcat))
+        # Add user_id and source
+        final_recos = (
+            final_recos
+            .withColumn("user_id", F.lit(user_id))
+            .withColumn("source", F.lit("ALS Hierarchy: Brand → Subcat → Pop"))
+        )
+        return final_recos.limit(5)
+
+    # =====================================================
+    # Step 4️⃣ — Cold Start User (no ALS history)
+    # =====================================================
+    else:
+        brand_recos = (
+            brand_popularity_table
+            .filter(F.col("brandName") == brandName)
+            .select("skuCode", "brandName", "subCategoryName")
+        )
+        brand_recos = pseudo_random(brand_recos, "skuCode", user_id, 5)
+        final_recos = brand_recos.limit(5)
+        remaining = 5 - final_recos.count()
+
+        if remaining > 0:
+            sub_pop = (
+                subcategory_popularity_table
+                .filter(F.col("subCategoryName") == subCategoryName)
+                .select("skuCode", "brandName", "subCategoryName")
+            )
+            sub_pop = pseudo_random(sub_pop, "skuCode", user_id, remaining * 2)
+            final_recos = merge_recos(final_recos, sub_pop, remaining)
+            remaining = 5 - final_recos.count()
+
+        if remaining > 0:
+            overall_pop = pseudo_random(overall_popularity_table, "skuCode", user_id, remaining * 2)
+            final_recos = merge_recos(final_recos, overall_pop, remaining)
+
+        final_recos = (
+            final_recos
+            .withColumn("user_id", F.lit(user_id))
+            .withColumn("source", F.lit("Cold Start: Brand → Subcat → Pop"))
+        )
+        return final_recos.limit(5)
