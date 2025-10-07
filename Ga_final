@@ -295,6 +295,138 @@ def get_user_recommendations(user_id, current_sku):
 
 
 
+
+
+
+
+2nd approach
+
+from pyspark.sql import functions as F
+
+def get_user_recommendations(user_id, current_sku):
+    # Step 1️⃣ — Check if SKU present in df_category
+    sku_data = (
+        df_category.filter(F.col("skuCode") == current_sku)
+        .select("brandName", "subCategoryName")
+        .first()
+    )
+    if not sku_data:
+        return f"SKU {current_sku} not found in df_category."
+
+    brandName = sku_data["brandName"]
+    subCategoryName = sku_data["subCategoryName"]
+
+    # Step 2️⃣ — Check if user exists in ALS table
+    user_exists = (
+        als_brand_recos_table.filter(F.col("user_id") == user_id).limit(1).count() > 0
+    )
+
+    # Helper to randomly pick up to n rows efficiently (no full shuffle)
+    def random_limit(df, n):
+        count = df.count()
+        if count == 0:
+            return spark.createDataFrame([], df.schema)
+        fraction = min(1.0, (n * 2) / count)
+        return df.sample(withReplacement=False, fraction=fraction).limit(n)
+
+    # Helper to merge recommendations (keep unique SKUs)
+    def merge_recos(base_df, add_df):
+        return (
+            base_df.union(add_df)
+            .dropDuplicates(["skuCode"])
+            .limit(5)
+        )
+
+    # =====================================================
+    # Step 3️⃣ — ALS Flow
+    # =====================================================
+    if user_exists:
+        # a) ALS brand recommendations (randomly pick)
+        als_brand_recos = (
+            als_brand_recos_table
+            .filter((F.col("user_id") == user_id) & (F.col("brandName") == brandName))
+            .select("skuCode", "brandName", "subCategoryName")
+        )
+
+        final_recos = random_limit(als_brand_recos, 5)
+        remaining = 5 - final_recos.count()
+
+        # b) Backfill from ALS subcategory
+        if remaining > 0:
+            als_subcat_recos = (
+                als_brand_recos_table
+                .filter((F.col("user_id") == user_id) & (F.col("subCategoryName") == subCategoryName))
+                .select("skuCode", "brandName", "subCategoryName")
+            )
+            final_recos = merge_recos(final_recos, random_limit(als_subcat_recos, remaining))
+            remaining = 5 - final_recos.count()
+
+        # c) Brand popularity
+        if remaining > 0:
+            brand_pop = (
+                brand_popularity_table
+                .filter(F.col("brandName") == brandName)
+                .select("skuCode", "brandName", "subCategoryName")
+            )
+            final_recos = merge_recos(final_recos, random_limit(brand_pop, remaining))
+            remaining = 5 - final_recos.count()
+
+        # d) Overall popularity
+        if remaining > 0:
+            overall_pop = (
+                overall_popularity_table
+                .select("skuCode", "brandName", "subCategoryName")
+            )
+            final_recos = merge_recos(final_recos, random_limit(overall_pop, remaining))
+
+        final_recos = (
+            final_recos
+            .withColumn("user_id", F.lit(user_id))
+            .withColumn("source", F.lit("ALS Hierarchy (Random Sample): Brand → Subcat → Pop"))
+        )
+
+        return final_recos.limit(5)
+
+    # =====================================================
+    # Step 4️⃣ — Cold Start Flow
+    # =====================================================
+    else:
+        # a) Brand popularity (random)
+        brand_recos = (
+            brand_popularity_table
+            .filter(F.col("brandName") == brandName)
+            .select("skuCode", "brandName", "subCategoryName")
+        )
+        final_recos = random_limit(brand_recos, 5)
+        remaining = 5 - final_recos.count()
+
+        # b) Subcategory popularity
+        if remaining > 0:
+            sub_pop = (
+                subcategory_popularity_table
+                .filter(F.col("subCategoryName") == subCategoryName)
+                .select("skuCode", "brandName", "subCategoryName")
+            )
+            final_recos = merge_recos(final_recos, random_limit(sub_pop, remaining))
+            remaining = 5 - final_recos.count()
+
+        # c) Overall popularity
+        if remaining > 0:
+            overall_pop = overall_popularity_table.select("skuCode", "brandName", "subCategoryName")
+            final_recos = merge_recos(final_recos, random_limit(overall_pop, remaining))
+
+        final_recos = (
+            final_recos
+            .withColumn("user_id", F.lit(user_id))
+            .withColumn("source", F.lit("Cold Start (Random Sample): Brand → Subcat → Pop"))
+        )
+
+        return final_recos.limit(5)
+
+
+
+
+
 # Example inputs
 user_id = "U12345"
 current_sku = "SKU98765"
