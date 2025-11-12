@@ -1,0 +1,128 @@
+from pyspark.sql import SparkSession
+from pyspark.ml.recommendation import ALS
+from pyspark.ml.feature import StringIndexer
+from pyspark.sql import functions as F
+
+spark = SparkSession.builder.appName("ALS-Recommendation").getOrCreate()
+
+# === Load raw interaction data ===
+# Columns: user_id, sku_code, total
+data = spark.read.table("user_sku_interactions")
+
+# === Encode categorical columns ===
+user_indexer = StringIndexer(inputCol="user_id", outputCol="userIndex", handleInvalid="skip")
+item_indexer = StringIndexer(inputCol="sku_code", outputCol="itemIndex", handleInvalid="skip")
+
+data = user_indexer.fit(data).transform(data)
+data = item_indexer.fit(data).transform(data)
+
+# === Train ALS model ===
+als = ALS(
+    userCol="userIndex",
+    itemCol="itemIndex",
+    ratingCol="total",
+    rank=50,
+    regParam=0.1,
+    implicitPrefs=True,
+    coldStartStrategy="drop"
+)
+
+als_model = als.fit(data)
+
+# === Store model outputs ===
+item_factors = als_model.itemFactors
+user_factors = als_model.userFactors
+
+# Save to catalog / storage
+item_factors.write.mode("overwrite").saveAsTable("item_factors_base")
+user_factors.write.mode("overwrite").saveAsTable("user_factors_base")
+
+# Generate initial recommendations
+recommendations = als_model.recommendForAllUsers(100)
+recommendations.write.mode("overwrite").saveAsTable("als_recommendations_base")
+
+
+
+
+2 nd
+
+from pyspark.sql import functions as F
+import numpy as np
+
+# Load item factors and new user activity logs
+item_factors = spark.read.table("item_factors_base")
+new_activity = spark.read.table("user_sku_interactions_daily")  # New data since last update
+
+# Convert sku_code → itemIndex (using saved StringIndexer model)
+# Assuming indexer models are saved, reload and transform
+item_indexer_model = ...  # load your fitted StringIndexerModel
+new_activity = item_indexer_model.transform(new_activity)
+
+# For each user, aggregate all activity (old + new)
+# Optionally union with previous month’s interactions for same user
+aggregated = new_activity.groupBy("user_id", "itemIndex").agg(F.sum("total").alias("total"))
+
+# Convert to Python and compute user vector
+def compute_user_vector(user_df, item_factors_df, lambda_reg=0.1):
+    user_items = [r['itemIndex'] for r in user_df.collect()]
+    ratings = np.array([r['total'] for r in user_df.collect()])
+
+    item_vecs = item_factors_df.filter(F.col("id").isin(user_items)).collect()
+    V = np.array([r['features'] for r in item_vecs])
+
+    A = V.T @ V + lambda_reg * np.eye(V.shape[1])
+    b = V.T @ ratings
+    u = np.linalg.solve(A, b)
+    return u.tolist()
+
+# Compute for each user who has new activity
+updated_user_factors = []
+for user_id in aggregated.select("user_id").distinct().collect():
+    user_df = aggregated.filter(F.col("user_id") == user_id["user_id"])
+    u_vec = compute_user_vector(user_df, item_factors)
+    updated_user_factors.append((user_id["user_id"], u_vec))
+
+# Convert to Spark DataFrame
+updated_df = spark.createDataFrame(updated_user_factors, ["user_id", "features"])
+updated_df.write.mode("overwrite").saveAsTable("user_factors_delta")
+
+
+3 rd
+
+import numpy as np
+from pyspark.sql import Row
+
+def get_user_vector(user_id, spark):
+    # Try to fetch updated user factor
+    delta = spark.read.table("user_factors_delta")
+    base = spark.read.table("user_factors_base")
+
+    user_factor = delta.filter(F.col("user_id") == user_id).collect()
+    if not user_factor:
+        # Fallback to base
+        user_factor = base.filter(F.col("id") == user_id).collect()
+    if not user_factor:
+        return None
+    return np.array(user_factor[0]['features'])
+
+def get_topN_recommendations(user_id, N=10):
+    user_vec = get_user_vector(user_id, spark)
+    if user_vec is None:
+        # Cold-start fallback
+        popular_items = spark.read.table("popular_items").limit(N)
+        return [r['sku_code'] for r in popular_items.collect()]
+    
+    item_factors = spark.read.table("item_factors_base")
+    item_rows = item_factors.collect()
+    
+    scores = [(r['id'], np.dot(user_vec, np.array(r['features']))) for r in item_rows]
+    top_items = sorted(scores, key=lambda x: x[1], reverse=True)[:N]
+    
+    # Decode itemIndex → sku_code
+    index_to_sku = spark.read.table("sku_index_mapping")  # previously stored
+    top_skus = [index_to_sku.filter(F.col("itemIndex") == i[0]).select("sku_code").first()["sku_code"] for i in top_items]
+    return top_skus
+
+# Example call
+recommendations = get_topN_recommendations(user_id="U123", N=10)
+print(recommendations)
