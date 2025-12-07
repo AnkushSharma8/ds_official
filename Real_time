@@ -216,4 +216,75 @@ def run_daily(df_daily):
     final = run_daily_step2_final_recos()
     return final
 
++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+def run_daily_step2_blend():
+    user_long = spark.table(LONG_TERM_EMB_TABLE)
+    user_short = spark.table("short_term_user_emb")
+
+    def blend(a, b):
+        import numpy as np
+        if a is None: return b
+        if b is None: return a
+        return (0.7 * np.array(a) + 0.3 * np.array(b)).tolist()
+
+    blend_udf = F.udf(blend, ArrayType(FloatType()))
+
+    blended = (
+        user_long.alias("l")
+        .join(user_short.alias("s"), "user_id", "outer")
+        .withColumn("final_emb", blend_udf("l.user_emb", "s.short_emb"))
+        .select("user_id", "final_emb")
+    )
+
+    return blended
+-------
+
+
+
+def run_daily_step3_rank(blended):
+    item_emb = spark.table(ITEM_EMB_TABLE)
+    als_candidates = spark.table(ALS_BACKBONE_TABLE)
+
+    # Attach item vectors to ALS candidates
+    candidates = (
+        als_candidates
+        .join(blended, "user_id")
+        .join(item_emb, "skuCode")
+    )
+
+    # Dot product (final embedding · item embedding)
+    def dot(a, b):
+        import numpy as np
+        return float(np.dot(a, b))
+
+    dot_udf = F.udf(dot, FloatType())
+
+    scored = candidates.withColumn(
+        "final_score",
+        dot_udf("final_emb", "item_emb")
+    )
+
+    # TOP 100 final recos
+    w = Window.partitionBy("user_id").orderBy(F.desc("final_score"))
+
+    final = (
+        scored
+        .withColumn("rank", F.row_number().over(w))
+        .filter(F.col("rank") <= 100)
+        .select("user_id", "skuCode", "final_score")
+    )
+
+    final.write.mode("overwrite").saveAsTable(FINAL_RECOS_TABLE)
+
+    return final
+-------------
+
+
+def run_daily(df_daily):
+    short = run_daily_step1_short_embeddings(df_daily)
+    blended = run_daily_step2_blend()
+    final = run_daily_step3_rank(blended)
+    return final
 
