@@ -1,128 +1,219 @@
-from pyspark.sql import SparkSession
-from pyspark.ml.recommendation import ALS
+
+###Spark + ALS + daily embedding blending
+
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.window import Window
 from pyspark.ml.feature import StringIndexer
-from pyspark.sql import functions as F
+from pyspark.ml.recommendation import ALS, ALSModel
+from pyspark.sql.types import ArrayType, FloatType
 
-spark = SparkSession.builder.appName("ALS-Recommendation").getOrCreate()
+spark = SparkSession.builder.getOrCreate()
 
-# === Load raw interaction data ===
-# Columns: user_id, sku_code, total
-data = spark.read.table("user_sku_interactions")
+DB = "cdp.product_recommendation"
 
-# === Encode categorical columns ===
-user_indexer = StringIndexer(inputCol="user_id", outputCol="userIndex", handleInvalid="skip")
-item_indexer = StringIndexer(inputCol="sku_code", outputCol="itemIndex", handleInvalid="skip")
+# Tables
+ALS_BACKBONE_TABLE = f"{DB}.als_backbone"
+USER_IDX_MAP_TABLE = f"{DB}.user_idx_map"
+ITEM_IDX_MAP_TABLE = f"{DB}.item_idx_map"
+LONG_TERM_EMB_TABLE = f"{DB}.long_term_user_emb"
+ITEM_EMB_TABLE = f"{DB}.item_emb"
+FINAL_RECOS_TABLE = f"{DB}.final_recos"
 
-data = user_indexer.fit(data).transform(data)
-data = item_indexer.fit(data).transform(data)
+# Paths
+MODEL_PATH = "dbfs:/FileStore/models/als_monthly"
 
-# === Train ALS model ===
-als = ALS(
-    userCol="userIndex",
-    itemCol="itemIndex",
-    ratingCol="total",
-    rank=50,
-    regParam=0.1,
-    implicitPrefs=True,
-    coldStartStrategy="drop"
-)
+# Params
+TOP_N = 100
+RANK = 130
+ALPHA_BLEND = 0.7  # weight for monthly ALS
+BETA_BLEND = 0.3   # weight for daily behavior
 
-als_model = als.fit(data)
+---------------------------------------------------
 
-# === Store model outputs ===
-item_factors = als_model.itemFactors
-user_factors = als_model.userFactors
+###Train ALS → produce long-term user embeddings + item embeddings
 
-# Save to catalog / storage
-item_factors.write.mode("overwrite").saveAsTable("item_factors_base")
-user_factors.write.mode("overwrite").saveAsTable("user_factors_base")
+def run_monthly(df_history):
+    """
+    Monthly ALS training on full historical data.
+    Produces:
+    - ALS model
+    - User long-term embedding table
+    - Item embedding table
+    - Backbone (ALS-only) recommendations table
+    """
+    # Clean
+    df = df_history.dropna(subset=["user_id", "skuCode", "total"])
 
-# Generate initial recommendations
-recommendations = als_model.recommendForAllUsers(100)
-recommendations.write.mode("overwrite").saveAsTable("als_recommendations_base")
+    # Indexers
+    user_indexer = StringIndexer(
+        inputCol="user_id", outputCol="userIdx", handleInvalid="skip"
+    ).fit(df)
+
+    item_indexer = StringIndexer(
+        inputCol="skuCode", outputCol="itemIdx", handleInvalid="skip"
+    ).fit(df)
+
+    df_idx = user_indexer.transform(df)
+    df_idx = item_indexer.transform(df_idx)
+
+    df_idx = df_idx.withColumn("userIdx", F.col("userIdx").cast("int"))
+    df_idx = df_idx.withColumn("itemIdx", F.col("itemIdx").cast("int"))
+
+    # Train ALS
+    als = ALS(
+        userCol="userIdx",
+        itemCol="itemIdx",
+        ratingCol="total",
+        implicitPrefs=True,
+        rank=RANK,
+        regParam=3,
+        alpha=15,
+        nonnegative=True,
+        coldStartStrategy="drop",
+        maxIter=20
+    )
+
+    als_model = als.fit(df_idx)
+
+    # Save ALS model
+    als_model.write().overwrite().save(MODEL_PATH)
+
+    # Save index maps
+    df_idx.select("userIdx", "user_id").dropDuplicates(["userIdx"]).write.mode("overwrite").saveAsTable(USER_IDX_MAP_TABLE)
+    df_idx.select("itemIdx", "skuCode").dropDuplicates(["itemIdx"]).write.mode("overwrite").saveAsTable(ITEM_IDX_MAP_TABLE)
+
+    # Extract embeddings
+    user_emb = als_model.userFactors.withColumnRenamed("id", "userIdx").withColumnRenamed("features", "user_emb")
+    item_emb = als_model.itemFactors.withColumnRenamed("id", "itemIdx").withColumnRenamed("features", "item_emb")
+
+    # Join with index→id mapping
+    user_emb = user_emb.join(spark.table(USER_IDX_MAP_TABLE), "userIdx", "left").select("user_id", "user_emb")
+    item_emb = item_emb.join(spark.table(ITEM_IDX_MAP_TABLE), "itemIdx", "left").select("skuCode", "item_emb")
+
+    user_emb.write.mode("overwrite").saveAsTable(LONG_TERM_EMB_TABLE)
+    item_emb.write.mode("overwrite").saveAsTable(ITEM_EMB_TABLE)
+
+    # Backbone ALS-only recos
+    recos = als_model.recommendForAllUsers(TOP_N)
+
+    als_exp = (
+        recos
+        .select("userIdx", F.explode("recommendations").alias("rec"))
+        .select("userIdx", F.col("rec.itemIdx").alias("itemIdx"), F.col("rec.rating").alias("als_score"))
+        .join(spark.table(USER_IDX_MAP_TABLE), "userIdx")
+        .join(spark.table(ITEM_IDX_MAP_TABLE), "itemIdx")
+        .select("user_id", "skuCode", "als_score")
+    )
+
+    w = Window.partitionBy("user_id").orderBy(F.desc("als_score"))
+    als_rank = als_exp.withColumn("rank", F.row_number().over(w)).filter(F.col("rank") <= TOP_N)
+
+    als_rank.write.mode("overwrite").saveAsTable(ALS_BACKBONE_TABLE)
+
+    return als_model
+--------------------------------------
 
 
+###Compute user short-term intent embedding
+
+def run_daily_step1_short_embeddings(df_daily):
+    """
+    Compute short-term user embeddings from daily interactions.
+    Output table: short_term_user_emb (temp view)
+    """
+
+    item_emb = spark.table(ITEM_EMB_TABLE)
+
+    # Join with SKU embeddings
+    df = (
+        df_daily
+        .dropna(subset=["user_id", "skuCode", "total"])
+        .join(item_emb, "skuCode", "inner")
+    )
+
+    # Weighted average embedding UDF
+    def weighted_avg(vectors, weights):
+        import numpy as np
+        return (np.array(vectors).T @ np.array(weights) / sum(weights)).tolist()
+
+    wa_udf = F.udf(weighted_avg, ArrayType(FloatType()))
+
+    grouped = (
+        df.groupBy("user_id")
+        .agg(
+            F.collect_list("item_emb").alias("item_emb_list"),
+            F.collect_list("total").alias("weight_list")
+        )
+        .withColumn("short_emb", wa_udf("item_emb_list", "weight_list"))
+        .select("user_id", "short_emb")
+    )
+
+    grouped.createOrReplaceTempView("short_term_user_emb")
+
+    return grouped
+--------------------------------------------
+
+####final_vec = α * long_term + (1−α) * short_term
+
+def run_daily_step2_final_recos():
+    """
+    Blend long-term (ALS) embeddings + short-term embeddings.
+    Generate top-N recommendations.
+    """
+    user_long = spark.table(LONG_TERM_EMB_TABLE)
+    user_short = spark.table("short_term_user_emb")
+    item_emb = spark.table(ITEM_EMB_TABLE)
+
+    # Merge long-term + short-term vectors
+    def blend_vec(long, short):
+        import numpy as np
+        if long is None:
+            return short
+        if short is None:
+            return long
+        return (ALPHA_BLEND * np.array(long) + BETA_BLEND * np.array(short)).tolist()
+
+    blend_udf = F.udf(blend_vec, ArrayType(FloatType()))
+
+    blended = (
+        user_long.alias("l")
+        .join(user_short.alias("s"), "user_id", "full")
+        .withColumn("final_emb", blend_udf("l.user_emb", "s.short_emb"))
+        .select("user_id", "final_emb")
+    )
+
+    # Cross join with items → compute dot product
+    item_df = item_emb.select("skuCode", "item_emb")
+
+    def dot(a, b):
+        import numpy as np
+        return float(np.dot(a, b))
+
+    dot_udf = F.udf(dot, FloatType())
+
+    scores = (
+        blended.crossJoin(item_df)
+        .withColumn("final_score", dot_udf("final_emb", "item_emb"))
+        .select("user_id", "skuCode", "final_score")
+    )
+
+    # Rank top N per user
+    w = Window.partitionBy("user_id").orderBy(F.desc("final_score"))
+
+    ranked = (
+        scores.withColumn("rank", F.row_number().over(w))
+        .filter(F.col("rank") <= TOP_N)
+    )
+
+    ranked.write.mode("overwrite").saveAsTable(FINAL_RECOS_TABLE)
+
+    return ranked
+---------------------------------------------
 
 
-2 nd
-
-from pyspark.sql import functions as F
-import numpy as np
-
-# Load item factors and new user activity logs
-item_factors = spark.read.table("item_factors_base")
-new_activity = spark.read.table("user_sku_interactions_daily")  # New data since last update
-
-# Convert sku_code → itemIndex (using saved StringIndexer model)
-# Assuming indexer models are saved, reload and transform
-item_indexer_model = ...  # load your fitted StringIndexerModel
-new_activity = item_indexer_model.transform(new_activity)
-
-# For each user, aggregate all activity (old + new)
-# Optionally union with previous month’s interactions for same user
-aggregated = new_activity.groupBy("user_id", "itemIndex").agg(F.sum("total").alias("total"))
-
-# Convert to Python and compute user vector
-def compute_user_vector(user_df, item_factors_df, lambda_reg=0.1):
-    user_items = [r['itemIndex'] for r in user_df.collect()]
-    ratings = np.array([r['total'] for r in user_df.collect()])
-
-    item_vecs = item_factors_df.filter(F.col("id").isin(user_items)).collect()
-    V = np.array([r['features'] for r in item_vecs])
-
-    A = V.T @ V + lambda_reg * np.eye(V.shape[1])
-    b = V.T @ ratings
-    u = np.linalg.solve(A, b)
-    return u.tolist()
-
-# Compute for each user who has new activity
-updated_user_factors = []
-for user_id in aggregated.select("user_id").distinct().collect():
-    user_df = aggregated.filter(F.col("user_id") == user_id["user_id"])
-    u_vec = compute_user_vector(user_df, item_factors)
-    updated_user_factors.append((user_id["user_id"], u_vec))
-
-# Convert to Spark DataFrame
-updated_df = spark.createDataFrame(updated_user_factors, ["user_id", "features"])
-updated_df.write.mode("overwrite").saveAsTable("user_factors_delta")
+def run_daily(df_daily):
+    short = run_daily_step1_short_embeddings(df_daily)
+    final = run_daily_step2_final_recos()
+    return final
 
 
-3 rd
-
-import numpy as np
-from pyspark.sql import Row
-
-def get_user_vector(user_id, spark):
-    # Try to fetch updated user factor
-    delta = spark.read.table("user_factors_delta")
-    base = spark.read.table("user_factors_base")
-
-    user_factor = delta.filter(F.col("user_id") == user_id).collect()
-    if not user_factor:
-        # Fallback to base
-        user_factor = base.filter(F.col("id") == user_id).collect()
-    if not user_factor:
-        return None
-    return np.array(user_factor[0]['features'])
-
-def get_topN_recommendations(user_id, N=10):
-    user_vec = get_user_vector(user_id, spark)
-    if user_vec is None:
-        # Cold-start fallback
-        popular_items = spark.read.table("popular_items").limit(N)
-        return [r['sku_code'] for r in popular_items.collect()]
-    
-    item_factors = spark.read.table("item_factors_base")
-    item_rows = item_factors.collect()
-    
-    scores = [(r['id'], np.dot(user_vec, np.array(r['features']))) for r in item_rows]
-    top_items = sorted(scores, key=lambda x: x[1], reverse=True)[:N]
-    
-    # Decode itemIndex → sku_code
-    index_to_sku = spark.read.table("sku_index_mapping")  # previously stored
-    top_skus = [index_to_sku.filter(F.col("itemIndex") == i[0]).select("sku_code").first()["sku_code"] for i in top_items]
-    return top_skus
-
-# Example call
-recommendations = get_topN_recommendations(user_id="U123", N=10)
-print(recommendations)
