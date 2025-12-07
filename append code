@@ -1,0 +1,24 @@
+df_hist = spark.table("ga_final_duty_free")
+df_inc = spark.table("ga_final_duty_free_1_day")
+
+
+latest_date = df_inc.select(F.max("event_date")).collect()[0][0]
+
+
+df_today = df_inc.filter(F.col("event_date") == latest_date)
+
+
+df_today = df_today.select(df_hist.columns)
+
+
+df_today.write \
+    .format("delta") \
+    .mode("append") \
+    .saveAsTable("ga_final_duty_free")
+
+
+df_updated = df_hist.unionByName(df_today)
+
+df_updated.write \
+    .mode("overwrite") \
+    .saveAsTable("ga_final_duty_free")
